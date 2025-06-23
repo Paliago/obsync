@@ -5,7 +5,7 @@
 
 declare module "sst" {
   export interface Resource {
-    "Example": {
+    "API": {
       "name": string
       "type": "sst.aws.Function"
       "url": string
@@ -17,6 +17,16 @@ declare module "sst" {
     "Table": {
       "name": string
       "type": "sst.aws.Dynamo"
+    }
+    "TestHelper": {
+      "name": string
+      "type": "sst.aws.Function"
+      "url": string
+    }
+    "WebSocketAPI": {
+      "managementEndpoint": string
+      "type": "sst.aws.ApiGatewayWebSocket"
+      "url": string
     }
   }
 }

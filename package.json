@@ -1,6 +1,10 @@
 {
   "name": "obsync",
   "version": "0.0.0",
+  "scripts": {
+    "build-plugin": "cd packages/plugin && node esbuild.config.mjs production",
+    "deploy-plugin": "npm run build-plugin && cp packages/plugin/main.js /Users/alvinjohansson/Documents/obsidian/Stampen/.obsidian/plugins/obsync/main.js && cp packages/plugin/manifest.json /Users/alvinjohansson/Documents/obsidian/Stampen/.obsidian/plugins/obsync/manifest.json && echo '✅ Plugin deployed to Obsidian!'"
+  },
   "workspaces": {
     "packages": [
       "packages/*"

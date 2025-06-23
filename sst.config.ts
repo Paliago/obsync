@@ -34,10 +34,42 @@ export default $config({
       ttl: "expireAt",
     });
 
-    const example = new sst.aws.Function("Example", {
+    // WebSocket API for real-time sync
+    const websocketApi = new sst.aws.ApiGatewayWebSocket("WebSocketAPI", {
+      accessLog: {
+        retention: "1 week"
+      }
+    });
+
+    // Create routes to WebSocket API
+    websocketApi.route("$connect", {
+      handler: "packages/backend/src/websocket/connect.handler",
+      link: [table, websocketApi],
+    });
+    websocketApi.route("$disconnect", {
+      handler: "packages/backend/src/websocket/disconnect.handler",
+      link: [table, websocketApi],
+    });
+    websocketApi.route("$default", {
+      handler: "packages/backend/src/websocket/message.handler",
+      link: [table, bucket, websocketApi],
+    });
+
+    const api = new sst.aws.Function("API", {
       url: true,
       handler: "packages/backend/src/example.handler",
       link: [table, bucket],
     });
+
+    const testHelper = new sst.aws.Function("TestHelper", {
+      url: true,
+      handler: "packages/backend/src/test-helper.handler",
+      link: [table, bucket],
+    });
+
+    return {
+      api: api.url,
+      websocket: websocketApi.url,
+    };
   },
 });

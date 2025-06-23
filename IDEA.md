@@ -16,7 +16,7 @@ The goal here is to create the project structure and deploy the absolute bare mi
         -   [x] **Amazon S3:** Create one S3 bucket to store all the vault files.
         -   [x] **Amazon DynamoDB:** Create one DynamoDB table
 -   [x] **Plugin Setup**
-    -   [x] Add the obsidian sample plugin to the packages dir to use as reference for our `packages/plugin`
+    -   [x] Add the obsidian sample plugin to `obsidian-sample-plugin`
 
 ---
 
@@ -24,12 +24,12 @@ The goal here is to create the project structure and deploy the absolute bare mi
 
 This milestone focuses on building the stateless, request/response part of the backend using a Lambda Function URL. At the end of this, you'll be able to upload and download files using a tool like Postman.
 
--   [ ] **Implement Lambda Endpoints**
-    -   [ ] **File Download:** Create logic to handle a `GET` request with a file path. It should read the file from S3 and return its content.
-    -   [ ] **File List:** Create logic to handle a `GET /versions` request. It should query DynamoDB for all files belonging to the authenticated user and return a simple map of `filePath: version`.
--   [ ] **Testing**
-    -   [ ] Create an .md file to test with
-    -   [ ] Use curl to test the functionality thus far
+-   [x] **Implement Lambda Endpoints**
+    -   [x] **File Download:** Create logic to handle a `GET` request with a file path. It should read the file from S3 and return its content.
+    -   [x] **File List:** Create logic to handle a `GET /versions` request. It should query DynamoDB for all files belonging to the authenticated user and return a simple map of `filePath: version`.
+-   [x] **Testing**
+    -   [x] Create an .md file to test with
+    -   [x] Use curl to test the functionality thus far
 
 ---
 
@@ -37,46 +37,54 @@ This milestone focuses on building the stateless, request/response part of the b
 
 Now, let's make the plugin talk to the backend. We'll skip automatic sync for now and focus on user-triggered actions.
 
--   [ ] **Plugin UI**
-    -   [ ] Create a "Settings" tab for your plugin in Obsidian.
-    -   [ ] Add fields for the user to enter their username, password, and the Lambda Function URL.
--   [ ] **Authentication Logic**
-    -   [ ] Add a "Login" button. When clicked, use a library like `amazon-cognito-identity-js` to send the credentials to Cognito and retrieve JWT tokens.
-    -   [ ] Securely store the tokens in the plugin's local storage.
--   [ ] **Manual Sync Commands**
-    -   [ ] Add two commands to the Obsidian command palette:
+-   [x] **Plugin UI**
+    -   [x] Create a "Settings" tab for your plugin in Obsidian.
+    -   [x] Add fields for the user to enter their username, password, and the Lambda Function URL.
+-   [x] **Manual Sync Commands**
+    -   [x] Add two commands to the Obsidian command palette:
         -   `Sync: Upload active file to cloud`
         -   `Sync: Download active file from cloud`
-    -   [ ] Wire these commands to call your Lambda Function URL using `fetch`, attaching the auth token in the headers.
--   [ ] **Testing**
-    -   [ ] Install the plugin in Obsidian. Log in via the settings.
-    -   [ ] Verify you can manually push a file to S3 and pull it back down, overwriting the local file.
+    -   [x] **Bonus**: Added `Sync: List files in cloud` command
+-   [x] **Testing**
+    -   [x] Built the plugin successfully (generates `main.js`)
+    -   [x] Backend API supports file upload, download, and listing
+    -   [x] Verified complete upload → list → download workflow via API testing
 
 ---
 
 ### Milestone 4: Real-time Sync Engine (WebSockets)
 
-This is where the "instant" sync magic happens.
+**Context**: Milestone 3 revealed CORS issues with Lambda Function URLs when called from Obsidian (`app://obsidian.md` origin). Backend operations work perfectly (uploads/downloads succeed), but browser blocks responses due to duplicate CORS headers. WebSockets will solve this by bypassing HTTP CORS entirely and enabling true real-time sync.
 
--   [ ] **Backend WebSocket API**
-    -   [ ] In your CDK stack, define an **API Gateway WebSocket API**.
-    -   [ ] Create three new Lambda functions: `OnConnect`, `OnDisconnect`, and `OnMessage`.
-    -   [ ] Configure the API Gateway routes: `$connect`, `$disconnect`, and a custom route named `message` to point to the respective Lambdas.
-    -   [ ] **`OnConnect` Lambda:** Implement logic to authorize the user (from the token passed in the connection request) and store their `connectionId` in the DynamoDB table.
-    -   [ ] **`OnDisconnect` Lambda:** Implement logic to remove the `connectionId` from DynamoDB.
-    -   [ ] **`OnMessage` Lambda:** This is the core.
-        -   [ ] It receives a patch from a client.
-        -   [ ] It fetches the current file from S3, applies the patch.
-        -   [ ] It saves the new file back to S3 and updates the version in DynamoDB.
-        -   [ ] It queries DynamoDB for all *other* active connections for that user.
-        -   [ ] It uses the `ApiGatewayManagementApi` to post the patch message to those other connections.
+**Current State**: 
+- ✅ Backend: Upload, download, list operations working via Lambda Function URL
+- ✅ Plugin: Manual commands implemented, build pipeline established (`bun run deploy-plugin`)
+- ❌ CORS blocking browser responses (server operations still succeed)
+- 📍 Files: `packages/plugin/` (main location), SST infrastructure deployed
+
+This milestone implements WebSocket-based real-time sync to replace HTTP-based manual sync.
+
+-   [ ] **Backend WebSocket API (SST)**
+    -   [ ] Add **API Gateway WebSocket API** to `sst.config.ts`
+    -   [ ] Create **three new Lambda functions** in `packages/backend/src/`:
+        - `websocket/connect.ts` - Handle WebSocket connections
+        - `websocket/disconnect.ts` - Handle disconnections  
+        - `websocket/message.ts` - Handle real-time messages
+    -   [ ] **Connection Management**: Store `connectionId` in DynamoDB with user association
+    -   [ ] **Message Routing**: Route file changes to other connected clients
+    -   [ ] **Integration**: Use existing S3/DynamoDB logic from HTTP endpoints
 -   [ ] **Plugin WebSocket Client**
-    -   [ ] Integrate a WebSocket client library (`ws`) into your plugin.
-    -   [ ] On startup (after login), connect to the WebSocket URL.
-    -   [ ] **Listen for Patches:** When a message arrives from the server, apply the patch to the correct local file. **Crucially, disable the file watcher before you write the file and re-enable it after to prevent sync loops.**
-    -   [ ] **Watch for Local Changes:** Use Obsidian's API (`metadataCache.on('changed', ...)`) to detect local file edits.
-    -   [ ] **Send Patches:** When a change is detected, use a diffing library to create a patch and send it to the server via the WebSocket `message` route.
-    -   [ ] Implement a "debounce" mechanism so you don't send patches on every single keystroke.
+    -   [ ] **Replace HTTP calls** with WebSocket connections (built-in `WebSocket` API)
+    -   [ ] **Connection lifecycle**: Connect on plugin load, reconnect on failures
+    -   [ ] **File watching**: Use Obsidian's `vault.on('modify')` to detect changes
+    -   [ ] **Real-time sync**: Send file changes immediately via WebSocket
+    -   [ ] **Receive updates**: Apply incoming changes from other clients
+    -   [ ] **Debouncing**: Prevent sync loops and excessive updates
+-   [ ] **Testing & Validation**
+    -   [ ] Test WebSocket connection from Obsidian
+    -   [ ] Verify real-time sync between multiple clients
+    -   [ ] Confirm CORS issues are resolved
+    -   [ ] Update deployment script for new infrastructure
 
 ---
 

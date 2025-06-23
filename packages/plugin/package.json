@@ -1,17 +1,24 @@
 {
-  "name": "@obsync/plugin",
-  "type": "module",
-  "version": "0.0.0",
+  "name": "@obsync/plugin", 
+  "version": "1.0.0",
+  "description": "Personal cloud sync engine for Obsidian using AWS infrastructure",
+  "main": "main.js",
   "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test": "sst shell vitest"
   },
   "dependencies": {
     "sst": "catalog:",
-    "zod": "catalog:",
-    "esbuild": "0.17.3",
-    "obsidian": "latest"
+    "zod": "catalog:"
   },
   "devDependencies": {
+    "@types/node": "^16.11.6",
+    "builtin-modules": "3.3.0",
+    "esbuild": "0.17.3",
+    "obsidian": "latest", 
+    "tslib": "2.4.0",
+    "typescript": "4.7.4",
     "vitest": "catalog:"
   }
 }

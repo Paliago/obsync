@@ -1,0 +1,11 @@
+{
+	"id": "obsidian-sync-engine",
+	"name": "Obsidian Sync Engine",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Personal cloud sync engine for Obsidian using AWS infrastructure.",
+	"author": "alvinjohansson",
+	"authorUrl": "",
+	"fundingUrl": "",
+	"isDesktopOnly": false
+}
