@@ -34,6 +34,15 @@ export default class ObsidianSyncPlugin extends Plugin {
 	reconnectTimeout: NodeJS.Timeout | null = null;
 	fileWatchingEnabled: boolean = true;
 	lastModifiedTimes: Map<string, number> = new Map();
+	
+	// Bulk sync management
+	uploadQueue: string[] = [];
+	downloadQueue: string[] = [];
+	isProcessingQueue: boolean = false;
+	cloudFileVersions: Map<string, string> = new Map();
+	localFileVersions: Map<string, number> = new Map();
+	isBulkSyncing: boolean = false;
+	syncProgress: { current: number; total: number } = { current: 0, total: 0 };
 
 	async onload() {
 		await this.loadSettings();
@@ -54,6 +63,15 @@ export default class ObsidianSyncPlugin extends Plugin {
 			this.app.vault.on('modify', (file) => {
 				if (this.fileWatchingEnabled && file instanceof TFile && file.extension === 'md') {
 					this.debounceFileSync(file);
+				}
+			})
+		);
+
+		// File deletion watching
+		this.registerEvent(
+			this.app.vault.on('delete', (file) => {
+				if (file instanceof TFile && file.extension === 'md') {
+					this.handleFileDeleted(file.path);
 				}
 			})
 		);
@@ -121,6 +139,38 @@ export default class ObsidianSyncPlugin extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'sync-all-files',
+			name: 'Sync: Upload all files to cloud',
+			callback: () => {
+				this.syncAllFiles();
+			}
+		});
+
+		this.addCommand({
+			id: 'download-vault',
+			name: 'Sync: Download entire vault from cloud',
+			callback: () => {
+				this.downloadEntireVault();
+			}
+		});
+
+		this.addCommand({
+			id: 'check-sync-status',
+			name: 'Sync: Check which files are out of sync',
+			callback: () => {
+				this.checkSyncStatus();
+			}
+		});
+
+		this.addCommand({
+			id: 'smart-sync',
+			name: 'Sync: Smart sync (upload newer, download missing)',
+			callback: () => {
+				this.smartSync();
+			}
+		});
+
 		this.addSettingTab(new SyncSettingTab(this.app, this));
 	}
 
@@ -157,7 +207,19 @@ export default class ObsidianSyncPlugin extends Plugin {
 			error: '🟡'
 		};
 		
-		this.statusBarItem.setText(`${icons[state]} Sync: ${status}`);
+		let statusText = `${icons[state]} Sync: ${status}`;
+		
+		// Add progress indicator during bulk sync
+		if (this.isBulkSyncing && this.syncProgress.total > 0) {
+			statusText += ` (${this.syncProgress.current}/${this.syncProgress.total})`;
+		}
+		
+		// Add out-of-sync indicator
+		if (state === 'connected' && this.hasOutOfSyncFiles()) {
+			statusText += ' ⚠️';
+		}
+		
+		this.statusBarItem.setText(statusText);
 		this.statusBarItem.style.setProperty('color', colors[state]);
 		this.statusBarItem.style.setProperty('cursor', 'pointer');
 	}
@@ -221,6 +283,13 @@ export default class ObsidianSyncPlugin extends Plugin {
 				
 				// Send ping to test connection
 				this.sendWebSocketMessage({ action: 'ping' });
+				
+				// Check sync status after connecting
+				setTimeout(() => {
+					if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+						this.sendWebSocketMessage({ action: 'list' });
+					}
+				}, 1000);
 			};
 
 			this.ws.onmessage = (event) => {
@@ -321,7 +390,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 				
 			case 'file_list':
 				if (data.files) {
-					this.displayFileList(data.files);
+					this.handleFileListResponse(data.files);
 				}
 				break;
 				
@@ -330,6 +399,13 @@ export default class ObsidianSyncPlugin extends Plugin {
 					new Notice(`File updated by another client: ${data.filePath}`);
 					// Optionally auto-download the updated file
 					// this.downloadFile(data.filePath);
+				}
+				break;
+				
+			case 'delete_success':
+				if (data.filePath) {
+					new Notice(`File deleted from cloud: ${data.filePath}`);
+					console.log(`File deleted successfully: ${data.filePath}`);
 				}
 				break;
 				
@@ -474,6 +550,44 @@ export default class ObsidianSyncPlugin extends Plugin {
 		}, 2000);
 	}
 
+	private handleFileListResponse(files: Record<string, string>) {
+		// Store cloud file versions for comparison
+		this.cloudFileVersions.clear();
+		Object.entries(files).forEach(([path, version]) => {
+			this.cloudFileVersions.set(path, version);
+		});
+
+		// Determine what operation triggered this file list request
+		const statusText = this.statusBarItem.getText();
+		
+		if (statusText.includes('Smart syncing')) {
+			// This is for smart sync operation
+			this.processSmartSync(files);
+		} else if (this.isBulkSyncing) {
+			// This is for bulk download operation
+			this.downloadQueue = Object.keys(files);
+			this.syncProgress = { current: 0, total: this.downloadQueue.length };
+			
+			if (this.downloadQueue.length === 0) {
+				new Notice('No files found in cloud');
+				this.isBulkSyncing = false;
+				this.updateStatusBar('Connected', 'connected');
+			} else {
+				new Notice(`Downloading ${this.downloadQueue.length} files...`);
+				this.processDownloadQueue();
+			}
+		} else {
+			// This is for regular file list display or sync status check
+			this.displayFileList(files);
+			this.checkAndReportSyncStatus(files);
+		}
+
+		// Update status bar to show out-of-sync status
+		if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.isBulkSyncing) {
+			this.updateStatusBar('Connected', 'connected');
+		}
+	}
+
 	private displayFileList(files: Record<string, string>) {
 		const fileList = Object.keys(files);
 		
@@ -482,6 +596,87 @@ export default class ObsidianSyncPlugin extends Plugin {
 		} else {
 			const fileListText = fileList.map(path => `${path} (v${files[path]})`).join('\n');
 			new Notice(`Cloud files:\n${fileListText}`);
+		}
+	}
+
+	private checkAndReportSyncStatus(cloudFiles: Record<string, string>) {
+		const localFiles = this.app.vault.getMarkdownFiles();
+		const outOfSyncFiles: string[] = [];
+		const cloudOnlyFiles: string[] = [];
+		const localOnlyFiles: string[] = [];
+
+		console.log('=== SYNC STATUS DEBUG ===');
+		console.log(`Local files count: ${localFiles.length}`);
+		console.log(`Cloud files count: ${Object.keys(cloudFiles).length}`);
+
+		// Check files that exist locally
+		localFiles.forEach(file => {
+			const cloudVersion = cloudFiles[file.path];
+			if (!cloudVersion) {
+				localOnlyFiles.push(file.path);
+				console.log(`📤 LOCAL ONLY: ${file.path} (modified: ${new Date(file.stat.mtime)})`);
+			} else {
+				// Check if file has been modified since last sync
+				const lastKnownTime = this.lastModifiedTimes.get(file.path);
+				if (!lastKnownTime || file.stat.mtime > lastKnownTime) {
+					outOfSyncFiles.push(file.path);
+					console.log(`📝 OUT OF SYNC: ${file.path}`);
+					console.log(`  - File modified: ${new Date(file.stat.mtime)}`);
+					console.log(`  - Last known sync: ${lastKnownTime ? new Date(lastKnownTime) : 'Never'}`);
+					console.log(`  - Cloud version: ${cloudVersion}`);
+				} else {
+					console.log(`✅ IN SYNC: ${file.path}`);
+				}
+			}
+		});
+
+		// Check files that exist only in cloud
+		Object.keys(cloudFiles).forEach(cloudPath => {
+			const localFile = localFiles.find(f => f.path === cloudPath);
+			if (!localFile) {
+				cloudOnlyFiles.push(cloudPath);
+				console.log(`📥 CLOUD ONLY: ${cloudPath} (version: ${cloudFiles[cloudPath]})`);
+			}
+		});
+
+		console.log('=== SYNC STATUS SUMMARY ===');
+		console.log(`Out of sync: ${outOfSyncFiles.length}`);
+		console.log(`Local only: ${localOnlyFiles.length}`);
+		console.log(`Cloud only: ${cloudOnlyFiles.length}`);
+
+		// Report sync status
+		if (outOfSyncFiles.length === 0 && cloudOnlyFiles.length === 0 && localOnlyFiles.length === 0) {
+			new Notice('✅ All files are in sync');
+		} else {
+			let report = '📊 SYNC STATUS REPORT\n';
+			
+			if (outOfSyncFiles.length > 0) {
+				report += `\n📝 MODIFIED LOCALLY (${outOfSyncFiles.length}):\n`;
+				outOfSyncFiles.slice(0, 10).forEach(file => {
+					report += `   • ${file}\n`;
+				});
+				if (outOfSyncFiles.length > 10) report += `   ... and ${outOfSyncFiles.length - 10} more\n`;
+			}
+			
+			if (localOnlyFiles.length > 0) {
+				report += `\n📤 LOCAL ONLY (${localOnlyFiles.length}):\n`;
+				localOnlyFiles.slice(0, 10).forEach(file => {
+					report += `   • ${file}\n`;
+				});
+				if (localOnlyFiles.length > 10) report += `   ... and ${localOnlyFiles.length - 10} more\n`;
+			}
+			
+			if (cloudOnlyFiles.length > 0) {
+				report += `\n📥 CLOUD ONLY (${cloudOnlyFiles.length}):\n`;
+				cloudOnlyFiles.slice(0, 10).forEach(file => {
+					report += `   • ${file}\n`;
+				});
+				if (cloudOnlyFiles.length > 10) report += `   ... and ${cloudOnlyFiles.length - 10} more\n`;
+			}
+
+			report += '\n💡 Use "Smart sync" to sync both directions automatically!';
+
+			new Notice(report);
 		}
 	}
 
@@ -515,6 +710,321 @@ export default class ObsidianSyncPlugin extends Plugin {
 		const status = this.fileWatchingEnabled ? 'enabled' : 'disabled';
 		new Notice(`Automatic file watching ${status}`);
 		console.log(`File watching ${status}`);
+	}
+
+	// Bulk Sync Operations
+	async syncAllFiles() {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
+		}
+
+		if (this.isBulkSyncing) {
+			new Notice('Bulk sync already in progress');
+			return;
+		}
+
+		try {
+			this.isBulkSyncing = true;
+			const markdownFiles = this.app.vault.getMarkdownFiles();
+			
+			// Filter out files that don't need syncing
+			const filesToSync = markdownFiles.filter(file => {
+				// Always sync if we don't have version info, or if file is newer
+				const lastKnownTime = this.lastModifiedTimes.get(file.path);
+				return !lastKnownTime || file.stat.mtime > lastKnownTime;
+			});
+
+			if (filesToSync.length === 0) {
+				new Notice('All files are already in sync');
+				this.isBulkSyncing = false;
+				return;
+			}
+
+			this.syncProgress = { current: 0, total: filesToSync.length };
+			this.updateStatusBar('Syncing all files', 'syncing');
+
+			new Notice(`Syncing ${filesToSync.length} files...`);
+
+			// Process files in batches to avoid overwhelming the server
+			const batchSize = 3;
+			for (let i = 0; i < filesToSync.length; i += batchSize) {
+				const batch = filesToSync.slice(i, i + batchSize);
+				
+				// Process batch in parallel
+				await Promise.all(batch.map(async (file) => {
+					try {
+						await this.uploadFile(file);
+						this.syncProgress.current++;
+						this.updateStatusBar('Syncing all files', 'syncing');
+					} catch (error) {
+						console.error(`Failed to sync file ${file.path}:`, error);
+					}
+				}));
+
+				// Small delay between batches
+				if (i + batchSize < filesToSync.length) {
+					await new Promise(resolve => setTimeout(resolve, 500));
+				}
+			}
+
+			new Notice(`Successfully synced ${this.syncProgress.current} files`);
+			
+		} catch (error) {
+			console.error('Bulk sync failed:', error);
+			new Notice('Bulk sync failed: ' + (error as any).message);
+		} finally {
+			this.isBulkSyncing = false;
+			this.syncProgress = { current: 0, total: 0 };
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}
+	}
+
+	async downloadEntireVault() {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
+		}
+
+		if (this.isBulkSyncing) {
+			new Notice('Bulk operation already in progress');
+			return;
+		}
+
+		try {
+			this.isBulkSyncing = true;
+			this.updateStatusBar('Fetching file list', 'syncing');
+
+			// First get the list of all files in the cloud
+			const success = this.sendWebSocketMessage({ action: 'list' });
+			if (!success) {
+				throw new Error('Failed to request file list');
+			}
+
+			new Notice('Downloading entire vault from cloud...');
+			
+			// The file list response will be handled in handleWebSocketMessage
+			// and will trigger the actual download process
+			
+		} catch (error) {
+			console.error('Download vault failed:', error);
+			new Notice('Download vault failed: ' + (error as any).message);
+			this.isBulkSyncing = false;
+			this.syncProgress = { current: 0, total: 0 };
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}
+	}
+
+	async checkSyncStatus() {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
+		}
+
+		try {
+			this.updateStatusBar('Checking sync status', 'syncing');
+			
+			// Request file list to compare with local files
+			const success = this.sendWebSocketMessage({ action: 'list' });
+			if (!success) {
+				throw new Error('Failed to request file list');
+			}
+
+			// The comparison will be done in handleWebSocketMessage when we receive the file list
+			
+		} catch (error) {
+			console.error('Check sync status failed:', error);
+			new Notice('Check sync status failed: ' + (error as any).message);
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}
+	}
+
+	private hasOutOfSyncFiles(): boolean {
+		// Check if any local files have been modified since last sync
+		const markdownFiles = this.app.vault.getMarkdownFiles();
+		return markdownFiles.some(file => {
+			const lastKnownTime = this.lastModifiedTimes.get(file.path);
+			return !lastKnownTime || file.stat.mtime > lastKnownTime;
+		});
+	}
+
+	private async processDownloadQueue() {
+		if (this.downloadQueue.length === 0) {
+			this.isBulkSyncing = false;
+			this.syncProgress = { current: 0, total: 0 };
+			new Notice('Vault download completed');
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+			return;
+		}
+
+		const batchSize = 3;
+		const batch = this.downloadQueue.splice(0, batchSize);
+		
+		// Process batch in parallel
+		await Promise.all(batch.map(async (filePath) => {
+			try {
+				this.downloadFile(filePath);
+				await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
+			} catch (error) {
+				console.error(`Failed to download file ${filePath}:`, error);
+			}
+		}));
+
+		// Continue with next batch
+		setTimeout(() => this.processDownloadQueue(), 500);
+	}
+
+	async smartSync() {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
+		}
+
+		if (this.isBulkSyncing) {
+			new Notice('Bulk operation already in progress');
+			return;
+		}
+
+		try {
+			this.isBulkSyncing = true;
+			this.updateStatusBar('Smart syncing', 'syncing');
+
+			// First get the list of all files in the cloud
+			const success = this.sendWebSocketMessage({ action: 'list' });
+			if (!success) {
+				throw new Error('Failed to request file list');
+			}
+
+			new Notice('Starting smart sync (both directions)...');
+			
+			// The file list response will be handled in handleWebSocketMessage
+			// and will trigger the smart sync process
+			
+		} catch (error) {
+			console.error('Smart sync failed:', error);
+			new Notice('Smart sync failed: ' + (error as any).message);
+			this.isBulkSyncing = false;
+			this.syncProgress = { current: 0, total: 0 };
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}
+	}
+
+	private async processSmartSync(cloudFiles: Record<string, string>) {
+		const localFiles = this.app.vault.getMarkdownFiles();
+		const filesToUpload: TFile[] = [];
+		const filesToDownload: string[] = [];
+
+		console.log('=== SMART SYNC ANALYSIS ===');
+
+		// Check files that exist locally
+		localFiles.forEach(file => {
+			const cloudVersion = cloudFiles[file.path];
+			if (!cloudVersion) {
+				// File doesn't exist in cloud, upload it
+				filesToUpload.push(file);
+				console.log(`📤 WILL UPLOAD: ${file.path} (not in cloud)`);
+			} else {
+				// Check if file has been modified since last sync
+				const lastKnownTime = this.lastModifiedTimes.get(file.path);
+				if (!lastKnownTime || file.stat.mtime > lastKnownTime) {
+					// File was modified locally, upload it
+					filesToUpload.push(file);
+					console.log(`📤 WILL UPLOAD: ${file.path} (modified locally)`);
+				}
+			}
+		});
+
+		// Check files that exist only in cloud - download them
+		Object.keys(cloudFiles).forEach(cloudPath => {
+			const localFile = localFiles.find(f => f.path === cloudPath);
+			if (!localFile) {
+				filesToDownload.push(cloudPath);
+				console.log(`📥 WILL DOWNLOAD: ${cloudPath} (not local)`);
+			}
+		});
+
+		const totalOperations = filesToUpload.length + filesToDownload.length;
+		if (totalOperations === 0) {
+			new Notice('✅ All files are already in sync');
+			this.isBulkSyncing = false;
+			this.updateStatusBar('Connected', 'connected');
+			return;
+		}
+
+		this.syncProgress = { current: 0, total: totalOperations };
+		console.log(`Smart sync: ${filesToUpload.length} uploads, ${filesToDownload.length} downloads`);
+
+		// Process uploads first (in batches)
+		const batchSize = 3;
+		for (let i = 0; i < filesToUpload.length; i += batchSize) {
+			const batch = filesToUpload.slice(i, i + batchSize);
+			
+			await Promise.all(batch.map(async (file) => {
+				try {
+					await this.uploadFile(file);
+					this.syncProgress.current++;
+					this.updateStatusBar('Smart syncing', 'syncing');
+				} catch (error) {
+					console.error(`Failed to upload file ${file.path}:`, error);
+				}
+			}));
+
+			if (i + batchSize < filesToUpload.length) {
+				await new Promise(resolve => setTimeout(resolve, 500));
+			}
+		}
+
+		// Process downloads (in batches)
+		for (let i = 0; i < filesToDownload.length; i += batchSize) {
+			const batch = filesToDownload.slice(i, i + batchSize);
+			
+			batch.forEach(filePath => {
+				this.downloadFile(filePath);
+			});
+
+			if (i + batchSize < filesToDownload.length) {
+				await new Promise(resolve => setTimeout(resolve, 500));
+			}
+		}
+
+		new Notice(`Smart sync completed: ${filesToUpload.length} uploaded, ${filesToDownload.length} downloaded`);
+		this.isBulkSyncing = false;
+		this.syncProgress = { current: 0, total: 0 };
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			this.updateStatusBar('Connected', 'connected');
+		}
+	}
+
+	handleFileDeleted(filePath: string) {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			console.log(`File deleted locally but not connected: ${filePath}`);
+			return;
+		}
+
+		console.log(`File deleted locally, notifying cloud: ${filePath}`);
+		
+		const success = this.sendWebSocketMessage({
+			action: 'delete',
+			filePath: filePath
+		});
+
+		if (success) {
+			console.log(`Deletion request sent for: ${filePath}`);
+			// Remove from our tracking
+			this.lastModifiedTimes.delete(filePath);
+		} else {
+			console.error(`Failed to send deletion request for: ${filePath}`);
+		}
 	}
 }
 
@@ -584,7 +1094,15 @@ class SyncSettingTab extends PluginSettingTab {
 				<li>🟡 <strong>Error</strong> - Connection issues, click to retry</li>
 			</ul>
 
-			<p><strong>Advanced Commands (Ctrl/Cmd+P):</strong></p>
+			<p><strong>Bulk Operations (Ctrl/Cmd+P):</strong></p>
+			<ul>
+				<li><strong>Sync: Smart sync (upload newer, download missing)</strong> - ⭐ RECOMMENDED: Bidirectional sync</li>
+				<li><strong>Sync: Upload all files to cloud</strong> - Upload only (one direction)</li>
+				<li><strong>Sync: Download entire vault from cloud</strong> - Download only (one direction)</li>
+				<li><strong>Sync: Check which files are out of sync</strong> - Compare local vs cloud files</li>
+			</ul>
+
+			<p><strong>Individual File Commands:</strong></p>
 			<ul>
 				<li><strong>Sync: Upload active file to cloud</strong> - Manual upload of current file</li>
 				<li><strong>Sync: Download active file from cloud</strong> - Manual download of current file</li>

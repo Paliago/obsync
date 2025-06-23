@@ -1,7 +1,7 @@
 import { APIGatewayProxyHandler } from "aws-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, PutCommand, GetCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { ApiGatewayManagementApiClient, PostToConnectionCommand } from "@aws-sdk/client-apigatewaymanagementapi";
 import { Resource } from "sst";
 
@@ -27,6 +27,8 @@ export const handler: APIGatewayProxyHandler = async (event) => {
         return await handleFileUpload(message, connectionId, apiGatewayClient);
       case "download":
         return await handleFileDownload(message, connectionId, apiGatewayClient);
+      case "delete":
+        return await handleFileDelete(message, connectionId, apiGatewayClient);
       case "list":
         return await handleFileList(connectionId, apiGatewayClient);
       case "ping":
@@ -173,25 +175,126 @@ async function handleFileDownload(
   }
 }
 
+async function handleFileDelete(
+  message: any, 
+  connectionId: string, 
+  apiGatewayClient: ApiGatewayManagementApiClient
+) {
+  const { filePath } = message;
+  
+  if (!filePath) {
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "error",
+      message: "Missing filePath",
+    });
+    return { statusCode: 400, body: "Missing filePath" };
+  }
+
+  try {
+    const key = `files/${filePath}`;
+    
+    // Soft delete: Mark as deleted in DynamoDB with TTL
+    const expirationTime = Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60); // 30 days
+    
+    await docClient.send(
+      new PutCommand({
+        TableName: Resource.Table.name,
+        Item: {
+          pk: `FILE#${filePath}`,
+          sk: `DELETED#${Date.now()}`,
+          filePath,
+          deleted: true,
+          deletedAt: Date.now(),
+          deletedBy: connectionId,
+          expireAt: expirationTime, // DynamoDB TTL field - must be configured on table
+        },
+      })
+    );
+
+    // Remove the active file record to keep list queries clean
+    // Note: In a production system, you might want to scan and delete all VERSION# records
+    // For now, we'll just delete the latest version record if it exists
+    try {
+      const scanResponse = await docClient.send(
+        new ScanCommand({
+          TableName: Resource.Table.name,
+          FilterExpression: "pk = :pk AND begins_with(sk, :sk)",
+          ExpressionAttributeValues: {
+            ":pk": `FILE#${filePath}`,
+            ":sk": "VERSION#",
+          },
+        })
+      );
+
+      // Delete all version records for this file
+      for (const item of scanResponse.Items || []) {
+        await docClient.send(
+          new DeleteCommand({
+            TableName: Resource.Table.name,
+            Key: {
+              pk: item.pk,
+              sk: item.sk,
+            },
+          })
+        );
+      }
+    } catch (error) {
+      console.log("Note: Could not delete all version records, continuing...", error);
+    }
+
+    // Also delete from S3 to save storage costs
+    await s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: Resource.Storage.name,
+        Key: key,
+      })
+    );
+
+    // Notify the deleter
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "delete_success",
+      filePath,
+    });
+
+    // Broadcast file deletion to other connected clients
+    await broadcastFileChange(apiGatewayClient, connectionId, {
+      type: "file_changed",
+      filePath,
+      action: "delete",
+    });
+
+    console.log(`File deleted: ${filePath}`);
+    return { statusCode: 200, body: "File deleted successfully" };
+  } catch (error) {
+    console.error("Delete error:", error);
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "error",
+      message: "Delete failed",
+    });
+    return { statusCode: 500, body: "Delete failed" };
+  }
+}
+
 async function handleFileList(
   connectionId: string, 
   apiGatewayClient: ApiGatewayManagementApiClient
 ) {
   try {
-    // Get all files from DynamoDB
+    // Get all files from DynamoDB (excluding deleted files)
     const response = await docClient.send(
       new ScanCommand({
         TableName: Resource.Table.name,
-        FilterExpression: "begins_with(pk, :filePrefix)",
+        FilterExpression: "begins_with(pk, :filePrefix) AND begins_with(sk, :versionPrefix) AND attribute_not_exists(deleted)",
         ExpressionAttributeValues: {
           ":filePrefix": "FILE#",
+          ":versionPrefix": "VERSION#",
         },
       })
     );
 
     const files: Record<string, string> = {};
     response.Items?.forEach((item) => {
-      if (item.filePath && item.version) {
+      if (item.filePath && item.version && !item.deleted) {
         files[item.filePath] = item.version;
       }
     });

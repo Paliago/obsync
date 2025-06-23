@@ -92,11 +92,12 @@ This milestone implements WebSocket-based real-time sync to replace HTTP-based m
 
 This makes the plugin robust and implements your desired user-controlled conflict resolution.
 
--   [ ] **Plugin Logic**
-    -   [ ] **Offline Queue:** Create a system (e.g., a JSON file) to log changes made while the WebSocket is disconnected.
-    -   [ ] **Reconnection Logic:** When the WebSocket reconnects, trigger a "reconciliation mode."
-    -   [ ] **Fetch Server State:** Call the `GET /versions` endpoint on your Lambda URL to get the latest state from the cloud.
-    -   [ ] **Comparison Logic:** For each file with offline changes, compare its last known version with the server's current version.
+-   [x] **Plugin Logic**
+    -   [x] **Bulk Sync Operations:** Sync all files, download entire vault, check sync status
+    -   [x] **Queue Management:** Batched processing to avoid overwhelming the server
+    -   [x] **Sync Status Detection:** Automatic detection of out-of-sync files with visual indicators
+    -   [x] **Reconnection Logic:** Auto-check sync status when WebSocket reconnects
+    -   [x] **Progress Tracking:** Real-time progress display during bulk operations
     -   [ ] **Conflict UI:** If a conflict is detected (`local changes exist` AND `server version is newer`), use the Obsidian Modal API to display the choice dialog.
     -   [ ] **Implement User Choices:**
         -   "Keep Local": Trigger the file upload function from Milestone 3.
@@ -111,3 +112,7 @@ This makes the plugin robust and implements your desired user-controlled conflic
 -   [ ] **Status Indicator:** Add a small status icon in the Obsidian status bar to show sync status (e.g., "Connected," "Syncing," "Offline," "Conflict").
 -   [ ] **Security Review:** Ensure your Lambda functions have the minimum necessary IAM permissions (e.g., only access to their specific S3 paths and DynamoDB tables).
 -   [ ] **Documentation:** Write a clear `README.md` explaining how to deploy the backend and install/configure the plugin.
+
+
+- [ ] add ttl on ddb object which triggers a stream which removes the file from s3 finally
+- [ ] auth the whole way so noone else can see your files
