@@ -54,22 +54,5 @@ export default $config({
       handler: "packages/backend/src/websocket/message.handler",
       link: [table, bucket, websocketApi],
     });
-
-    const api = new sst.aws.Function("API", {
-      url: true,
-      handler: "packages/backend/src/example.handler",
-      link: [table, bucket],
-    });
-
-    const testHelper = new sst.aws.Function("TestHelper", {
-      url: true,
-      handler: "packages/backend/src/test-helper.handler",
-      link: [table, bucket],
-    });
-
-    return {
-      api: api.url,
-      websocket: websocketApi.url,
-    };
   },
 });

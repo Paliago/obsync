@@ -98,6 +98,7 @@ This makes the plugin robust and implements your desired user-controlled conflic
     -   [x] **Sync Status Detection:** Automatic detection of out-of-sync files with visual indicators
     -   [x] **Reconnection Logic:** Auto-check sync status when WebSocket reconnects
     -   [x] **Progress Tracking:** Real-time progress display during bulk operations
+    -   [x] **File Deletion Handling:** Local deletes propagate to cloud with soft delete + TTL
     -   [ ] **Conflict UI:** If a conflict is detected (`local changes exist` AND `server version is newer`), use the Obsidian Modal API to display the choice dialog.
     -   [ ] **Implement User Choices:**
         -   "Keep Local": Trigger the file upload function from Milestone 3.

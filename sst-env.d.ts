@@ -5,11 +5,6 @@
 
 declare module "sst" {
   export interface Resource {
-    "API": {
-      "name": string
-      "type": "sst.aws.Function"
-      "url": string
-    }
     "Storage": {
       "name": string
       "type": "sst.aws.Bucket"
@@ -17,11 +12,6 @@ declare module "sst" {
     "Table": {
       "name": string
       "type": "sst.aws.Dynamo"
-    }
-    "TestHelper": {
-      "name": string
-      "type": "sst.aws.Function"
-      "url": string
     }
     "WebSocketAPI": {
       "managementEndpoint": string
