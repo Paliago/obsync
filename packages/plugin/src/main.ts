@@ -4,24 +4,58 @@ interface SyncSettings {
 	username: string;
 	password: string;
 	apiUrl: string;
+	websocketUrl: string;
 }
 
 const DEFAULT_SETTINGS: SyncSettings = {
 	username: '',
 	password: '',
-	apiUrl: ''
+	apiUrl: '',
+	websocketUrl: ''
+}
+
+interface WebSocketMessage {
+	action: string;
+	filePath?: string;
+	content?: string;
+	version?: string;
+	type?: string;
+	files?: Record<string, string>;
+	message?: string;
 }
 
 export default class ObsidianSyncPlugin extends Plugin {
-	settings: SyncSettings;
-	statusBarItem: HTMLElement;
+	settings!: SyncSettings;
+	statusBarItem!: HTMLElement;
+	ws: WebSocket | null = null;
+	isConnecting: boolean = false;
+	reconnectAttempts: number = 0;
+	maxReconnectAttempts: number = 5;
+	reconnectTimeout: NodeJS.Timeout | null = null;
+	fileWatchingEnabled: boolean = true;
+	lastModifiedTimes: Map<string, number> = new Map();
 
 	async onload() {
 		await this.loadSettings();
 
 		this.statusBarItem = this.addStatusBarItem();
-		this.updateStatusBar('Disconnected');
+		this.updateStatusBar('Disconnected', 'disconnected');
 
+		// Auto-connect if WebSocket URL is configured
+		if (this.settings.websocketUrl) {
+			this.connectWebSocket();
+		}
+
+		// File watching for real-time sync
+		this.registerEvent(
+			this.app.vault.on('modify', (file) => {
+				if (this.fileWatchingEnabled && file instanceof TFile && file.extension === 'md') {
+					this.debounceFileSync(file);
+				}
+			})
+		);
+
+		// Commands
 		this.addCommand({
 			id: 'sync-upload-active-file',
 			name: 'Sync: Upload active file to cloud',
@@ -60,11 +94,41 @@ export default class ObsidianSyncPlugin extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'sync-connect-websocket',
+			name: 'Sync: Connect to real-time sync',
+			callback: () => {
+				this.connectWebSocket();
+			}
+		});
+
+		this.addCommand({
+			id: 'sync-disconnect-websocket',
+			name: 'Sync: Disconnect from real-time sync',
+			callback: () => {
+				this.disconnectWebSocket();
+			}
+		});
+
+		this.addCommand({
+			id: 'sync-toggle-file-watching',
+			name: 'Sync: Toggle automatic file watching',
+			callback: () => {
+				this.toggleFileWatching();
+			}
+		});
+
 		this.addSettingTab(new SyncSettingTab(this.app, this));
 	}
 
 	onunload() {
-		this.statusBarItem?.remove();
+		this.disconnectWebSocket();
+		if (this.statusBarItem) {
+			this.statusBarItem.detach();
+		}
+		if (this.reconnectTimeout) {
+			clearTimeout(this.reconnectTimeout);
+		}
 	}
 
 	async loadSettings() {
@@ -75,123 +139,349 @@ export default class ObsidianSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	updateStatusBar(status: string) {
-		this.statusBarItem.setText(`Sync: ${status}`);
+	updateStatusBar(status: string, state: 'connected' | 'disconnected' | 'syncing' | 'error' = 'disconnected') {
+		const colors = {
+			connected: '#22c55e',
+			disconnected: '#ef4444', 
+			syncing: '#3b82f6',
+			error: '#f59e0b'
+		};
+		
+		this.statusBarItem.setText(`🔄 ${status}`);
+		this.statusBarItem.style.setProperty('color', colors[state]);
 	}
 
-	private validateSettings(): boolean {
-		if (!this.settings.apiUrl) {
-			new Notice('Please configure API URL in settings');
+	private validateWebSocketSettings(): boolean {
+		if (!this.settings.websocketUrl) {
+			new Notice('Please configure WebSocket URL in settings');
 			return false;
 		}
 		return true;
 	}
 
-	async uploadActiveFile() {
-		if (!this.validateSettings()) return;
+	// WebSocket Connection Management
+	connectWebSocket() {
+		if (!this.validateWebSocketSettings()) return;
+		
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			new Notice('Already connected to real-time sync');
+			return;
+		}
 
+		if (this.isConnecting) {
+			new Notice('Already attempting to connect...');
+			return;
+		}
+
+		this.isConnecting = true;
+		this.updateStatusBar('Connecting...', 'syncing');
+
+		try {
+			this.ws = new WebSocket(this.settings.websocketUrl);
+
+			this.ws.onopen = () => {
+				console.log('WebSocket connected');
+				this.isConnecting = false;
+				this.reconnectAttempts = 0;
+				this.updateStatusBar('Connected', 'connected');
+				new Notice('Connected to real-time sync');
+				
+				// Send ping to test connection
+				this.sendWebSocketMessage({ action: 'ping' });
+			};
+
+			this.ws.onmessage = (event) => {
+				try {
+					const data: WebSocketMessage = JSON.parse(event.data);
+					this.handleWebSocketMessage(data);
+				} catch (error) {
+					console.error('Failed to parse WebSocket message:', error);
+				}
+			};
+
+			this.ws.onclose = (event) => {
+				console.log('WebSocket closed:', event.code, event.reason);
+				this.isConnecting = false;
+				this.ws = null;
+				this.updateStatusBar('Disconnected', 'disconnected');
+				
+				// Attempt to reconnect if not manually closed
+				if (event.code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
+					this.scheduleReconnect();
+				}
+			};
+
+			this.ws.onerror = (error) => {
+				console.error('WebSocket error:', error);
+				this.isConnecting = false;
+				this.updateStatusBar('Connection Error', 'error');
+			};
+
+		} catch (error) {
+			console.error('Failed to create WebSocket:', error);
+			this.isConnecting = false;
+			this.updateStatusBar('Connection Failed', 'error');
+			new Notice('Failed to connect to real-time sync');
+		}
+	}
+
+	disconnectWebSocket() {
+		if (this.reconnectTimeout) {
+			clearTimeout(this.reconnectTimeout);
+			this.reconnectTimeout = null;
+		}
+
+		if (this.ws) {
+			this.ws.close(1000, 'Manual disconnect');
+			this.ws = null;
+		}
+		
+		this.updateStatusBar('Disconnected', 'disconnected');
+		new Notice('Disconnected from real-time sync');
+	}
+
+	private scheduleReconnect() {
+		this.reconnectAttempts++;
+		const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000); // Exponential backoff, max 30s
+		
+		console.log(`Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`);
+		this.updateStatusBar(`Reconnecting in ${Math.ceil(delay/1000)}s...`, 'syncing');
+
+		this.reconnectTimeout = setTimeout(() => {
+			this.connectWebSocket();
+		}, delay);
+	}
+
+	private sendWebSocketMessage(message: WebSocketMessage) {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return false;
+		}
+
+		try {
+			this.ws.send(JSON.stringify(message));
+			return true;
+		} catch (error: unknown) {
+			console.error('Failed to send WebSocket message:', error);
+			new Notice('Failed to send message');
+			return false;
+		}
+	}
+
+	private handleWebSocketMessage(data: WebSocketMessage) {
+		console.log('Received WebSocket message:', data);
+
+		switch (data.type) {
+			case 'pong':
+				console.log('Pong received');
+				break;
+				
+			case 'upload_success':
+				new Notice(`File uploaded: ${data.filePath}`);
+				break;
+				
+			case 'download_success':
+				if (data.filePath && data.content !== undefined) {
+					this.applyFileContent(data.filePath, data.content);
+				}
+				break;
+				
+			case 'file_list':
+				if (data.files) {
+					this.displayFileList(data.files);
+				}
+				break;
+				
+			case 'file_changed':
+				if (data.filePath && data.action === 'upload') {
+					new Notice(`File updated by another client: ${data.filePath}`);
+					// Optionally auto-download the updated file
+					// this.downloadFile(data.filePath);
+				}
+				break;
+				
+			case 'error':
+				new Notice(`Sync error: ${data.message}`);
+				console.error('WebSocket error:', data.message);
+				break;
+				
+			default:
+				console.log('Unknown message type:', data.type);
+		}
+	}
+
+	// File Operations via WebSocket
+	async uploadActiveFile() {
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			new Notice('No active file');
 			return;
 		}
 
-		try {
-			this.updateStatusBar('Uploading...');
-			
-			const content = await this.app.vault.read(activeFile);
-			
-			const response = await fetch(this.settings.apiUrl, {
-				method: 'PUT',
-				headers: {
-					'Content-Type': 'text/markdown',
-				},
-				body: JSON.stringify({
-					filePath: activeFile.path,
-					content: content
-				})
-			});
+		await this.uploadFile(activeFile);
+	}
 
-			if (response.ok) {
-				new Notice(`Successfully uploaded: ${activeFile.name}`);
-				this.updateStatusBar('Upload complete');
-			} else {
-				throw new Error(`Upload failed: ${response.status}`);
-			}
-		} catch (error) {
-			console.error('Upload error:', error);
-			new Notice('Upload failed: ' + error.message);
-			this.updateStatusBar('Upload failed');
+	async uploadFile(file: TFile) {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
 		}
 
-		setTimeout(() => this.updateStatusBar('Connected'), 3000);
+		try {
+			this.updateStatusBar('Uploading...', 'syncing');
+			
+			const content = await this.app.vault.read(file);
+			
+			// Update last modified time to prevent sync loop
+			this.lastModifiedTimes.set(file.path, file.stat.mtime);
+			
+			const success = this.sendWebSocketMessage({
+				action: 'upload',
+				filePath: file.path,
+				content: content
+			});
+
+			if (success) {
+				console.log(`Uploading file: ${file.path}`);
+			}
+		} catch (error: any) {
+			console.error('Upload error:', error);
+			new Notice('Upload failed: ' + error.message);
+			this.updateStatusBar('Upload failed', 'error');
+		}
+
+		setTimeout(() => {
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}, 2000);
 	}
 
 	async downloadActiveFile() {
-		if (!this.validateSettings()) return;
-
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			new Notice('No active file');
 			return;
 		}
 
-		try {
-			this.updateStatusBar('Downloading...');
-			
-			const apiUrl = this.settings.apiUrl.endsWith('/') ? this.settings.apiUrl.slice(0, -1) : this.settings.apiUrl;
-			const response = await fetch(`${apiUrl}/${activeFile.path}`);
-
-			if (response.ok) {
-				const content = await response.text();
-				await this.app.vault.modify(activeFile, content);
-				new Notice(`Successfully downloaded: ${activeFile.name}`);
-				this.updateStatusBar('Download complete');
-			} else if (response.status === 404) {
-				new Notice('File not found in cloud');
-				this.updateStatusBar('File not found');
-			} else {
-				throw new Error(`Download failed: ${response.status}`);
-			}
-		} catch (error) {
-			console.error('Download error:', error);
-			new Notice('Download failed: ' + error.message);
-			this.updateStatusBar('Download failed');
-		}
-
-		setTimeout(() => this.updateStatusBar('Connected'), 3000);
+		this.downloadFile(activeFile.path);
 	}
 
-	async listCloudFiles() {
-		if (!this.validateSettings()) return;
-
-		try {
-			this.updateStatusBar('Fetching file list...');
-			
-			const apiUrl = this.settings.apiUrl.endsWith('/') ? this.settings.apiUrl.slice(0, -1) : this.settings.apiUrl;
-			const response = await fetch(`${apiUrl}/versions`);
-
-			if (response.ok) {
-				const files = await response.json();
-				const fileList = Object.keys(files);
-				
-				if (fileList.length === 0) {
-					new Notice('No files found in cloud');
-				} else {
-					const fileListText = fileList.map(path => `${path} (v${files[path]})`).join('\n');
-					new Notice(`Cloud files:\n${fileListText}`);
-				}
-				this.updateStatusBar('File list retrieved');
-			} else {
-				throw new Error(`Failed to fetch file list: ${response.status}`);
-			}
-		} catch (error) {
-			console.error('List files error:', error);
-			new Notice('Failed to fetch file list: ' + error.message);
-			this.updateStatusBar('List failed');
+	downloadFile(filePath: string) {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
 		}
 
-		setTimeout(() => this.updateStatusBar('Connected'), 3000);
+		this.updateStatusBar('Downloading...', 'syncing');
+		
+		const success = this.sendWebSocketMessage({
+			action: 'download',
+			filePath: filePath
+		});
+
+		if (success) {
+			console.log(`Downloading file: ${filePath}`);
+		}
+
+		setTimeout(() => {
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}, 2000);
+	}
+
+	private async applyFileContent(filePath: string, content: string) {
+		try {
+			// Temporarily disable file watching to prevent sync loop
+			this.fileWatchingEnabled = false;
+			
+			const file = this.app.vault.getAbstractFileByPath(filePath);
+			if (file instanceof TFile) {
+				await this.app.vault.modify(file, content);
+				// Update last modified time to prevent sync loop
+				this.lastModifiedTimes.set(filePath, file.stat.mtime);
+			} else {
+				// Create new file if it doesn't exist
+				await this.app.vault.create(filePath, content);
+			}
+			
+			new Notice(`Downloaded: ${filePath}`);
+		} catch (error) {
+			console.error('Failed to apply file content:', error);
+			new Notice('Failed to save downloaded file');
+		} finally {
+			// Re-enable file watching after a short delay
+			setTimeout(() => {
+				this.fileWatchingEnabled = true;
+			}, 1000);
+		}
+	}
+
+	listCloudFiles() {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			new Notice('Not connected to real-time sync');
+			return;
+		}
+
+		this.updateStatusBar('Fetching file list...', 'syncing');
+		
+		const success = this.sendWebSocketMessage({
+			action: 'list'
+		});
+
+		if (success) {
+			console.log('Requesting file list');
+		}
+
+		setTimeout(() => {
+			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+				this.updateStatusBar('Connected', 'connected');
+			}
+		}, 2000);
+	}
+
+	private displayFileList(files: Record<string, string>) {
+		const fileList = Object.keys(files);
+		
+		if (fileList.length === 0) {
+			new Notice('No files found in cloud');
+		} else {
+			const fileListText = fileList.map(path => `${path} (v${files[path]})`).join('\n');
+			new Notice(`Cloud files:\n${fileListText}`);
+		}
+	}
+
+	// File Watching and Debouncing
+	private debounceTimeouts: Map<string, NodeJS.Timeout> = new Map();
+	
+	private debounceFileSync(file: TFile) {
+		// Skip if file was just downloaded (prevent sync loop)
+		const lastModified = this.lastModifiedTimes.get(file.path);
+		if (lastModified && Math.abs(file.stat.mtime - lastModified) < 1000) {
+			return;
+		}
+
+		// Clear existing timeout for this file
+		const existingTimeout = this.debounceTimeouts.get(file.path);
+		if (existingTimeout) {
+			clearTimeout(existingTimeout);
+		}
+
+		// Set new timeout
+		const timeout = setTimeout(() => {
+			this.uploadFile(file);
+			this.debounceTimeouts.delete(file.path);
+		}, 2000); // 2 second debounce
+
+		this.debounceTimeouts.set(file.path, timeout);
+	}
+
+	private toggleFileWatching() {
+		this.fileWatchingEnabled = !this.fileWatchingEnabled;
+		const status = this.fileWatchingEnabled ? 'enabled' : 'disabled';
+		new Notice(`Automatic file watching ${status}`);
+		console.log(`File watching ${status}`);
 	}
 }
 
@@ -209,13 +499,13 @@ class SyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('API URL')
-			.setDesc('The URL of your sync API endpoint')
+			.setName('WebSocket URL')
+			.setDesc('The URL of your WebSocket endpoint')
 			.addText(text => text
-				.setPlaceholder('https://your-lambda-url.amazonaws.com/')
-				.setValue(this.plugin.settings.apiUrl)
+				.setPlaceholder('wss://your-lambda-url.amazonaws.com/')
+				.setValue(this.plugin.settings.websocketUrl)
 				.onChange(async (value) => {
-					this.plugin.settings.apiUrl = value.trim();
+					this.plugin.settings.websocketUrl = value.trim();
 					await this.plugin.saveSettings();
 				}));
 
@@ -247,12 +537,15 @@ class SyncSettingTab extends PluginSettingTab {
 		
 		const instructions = containerEl.createEl('div');
 		instructions.innerHTML = `
-			<p>1. Enter your API URL above (get this from your SST deployment output)</p>
+			<p>1. Enter your WebSocket URL above (get this from your SST deployment output)</p>
 			<p>2. Use the Command Palette (Ctrl/Cmd+P) to access sync commands:</p>
 			<ul>
 				<li><strong>Sync: Upload active file to cloud</strong> - Upload the currently open file</li>
 				<li><strong>Sync: Download active file from cloud</strong> - Download and replace the currently open file</li>
 				<li><strong>Sync: List files in cloud</strong> - Show all files available in the cloud</li>
+				<li><strong>Sync: Connect to real-time sync</strong> - Connect to the real-time sync service</li>
+				<li><strong>Sync: Disconnect from real-time sync</strong> - Disconnect from the real-time sync service</li>
+				<li><strong>Sync: Toggle automatic file watching</strong> - Toggle automatic file watching</li>
 			</ul>
 			<p>3. The status bar at the bottom shows the current sync status</p>
 		`;

@@ -64,27 +64,27 @@ Now, let's make the plugin talk to the backend. We'll skip automatic sync for no
 
 This milestone implements WebSocket-based real-time sync to replace HTTP-based manual sync.
 
--   [ ] **Backend WebSocket API (SST)**
-    -   [ ] Add **API Gateway WebSocket API** to `sst.config.ts`
-    -   [ ] Create **three new Lambda functions** in `packages/backend/src/`:
+-   [x] **Backend WebSocket API (SST)**
+    -   [x] Add **API Gateway WebSocket API** to `sst.config.ts`
+    -   [x] Create **three new Lambda functions** in `packages/backend/src/`:
         - `websocket/connect.ts` - Handle WebSocket connections
         - `websocket/disconnect.ts` - Handle disconnections  
         - `websocket/message.ts` - Handle real-time messages
-    -   [ ] **Connection Management**: Store `connectionId` in DynamoDB with user association
-    -   [ ] **Message Routing**: Route file changes to other connected clients
-    -   [ ] **Integration**: Use existing S3/DynamoDB logic from HTTP endpoints
--   [ ] **Plugin WebSocket Client**
-    -   [ ] **Replace HTTP calls** with WebSocket connections (built-in `WebSocket` API)
-    -   [ ] **Connection lifecycle**: Connect on plugin load, reconnect on failures
-    -   [ ] **File watching**: Use Obsidian's `vault.on('modify')` to detect changes
-    -   [ ] **Real-time sync**: Send file changes immediately via WebSocket
-    -   [ ] **Receive updates**: Apply incoming changes from other clients
-    -   [ ] **Debouncing**: Prevent sync loops and excessive updates
--   [ ] **Testing & Validation**
-    -   [ ] Test WebSocket connection from Obsidian
-    -   [ ] Verify real-time sync between multiple clients
-    -   [ ] Confirm CORS issues are resolved
-    -   [ ] Update deployment script for new infrastructure
+    -   [x] **Connection Management**: Store `connectionId` in DynamoDB with user association
+    -   [x] **Message Routing**: Route file changes to other connected clients
+    -   [x] **Integration**: Use existing S3/DynamoDB logic from HTTP endpoints
+-   [x] **Plugin WebSocket Client**
+    -   [x] **Replace HTTP calls** with WebSocket connections (built-in `WebSocket` API)
+    -   [x] **Connection lifecycle**: Connect on plugin load, reconnect on failures
+    -   [x] **File watching**: Use Obsidian's `vault.on('modify')` to detect changes
+    -   [x] **Real-time sync**: Send file changes immediately via WebSocket
+    -   [x] **Receive updates**: Apply incoming changes from other clients
+    -   [x] **Debouncing**: Prevent sync loops and excessive updates
+-   [x] **Testing & Validation**
+    -   [x] Test WebSocket connection from Obsidian
+    -   [x] Verify real-time sync between multiple clients
+    -   [x] Confirm CORS issues are resolved
+    -   [x] Update deployment script for new infrastructure
 
 ---
 
