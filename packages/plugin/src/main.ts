@@ -39,6 +39,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 		await this.loadSettings();
 
 		this.statusBarItem = this.addStatusBarItem();
+		this.statusBarItem.addClass('mod-clickable');
+		this.statusBarItem.setAttribute('aria-label', 'Click to toggle sync');
+		this.statusBarItem.addEventListener('click', () => this.toggleSync());
 		this.updateStatusBar('Disconnected', 'disconnected');
 
 		// Auto-connect if WebSocket URL is configured
@@ -147,8 +150,38 @@ export default class ObsidianSyncPlugin extends Plugin {
 			error: '#f59e0b'
 		};
 		
-		this.statusBarItem.setText(`🔄 ${status}`);
+		const icons = {
+			connected: '🟢',
+			disconnected: '🔴',
+			syncing: '🔵',
+			error: '🟡'
+		};
+		
+		this.statusBarItem.setText(`${icons[state]} Sync: ${status}`);
 		this.statusBarItem.style.setProperty('color', colors[state]);
+		this.statusBarItem.style.setProperty('cursor', 'pointer');
+	}
+
+	toggleSync() {
+		if (!this.validateWebSocketSettings()) {
+			// If no WebSocket URL is configured, show notice and open settings
+			new Notice('Please configure WebSocket URL in settings first');
+			// Open plugin settings tab
+			(this.app as any).setting.open();
+			(this.app as any).setting.openTabById(this.manifest.id);
+			return;
+		}
+
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			// Currently connected, so disconnect
+			this.disconnectWebSocket();
+		} else if (this.isConnecting) {
+			// Currently connecting, so cancel
+			this.disconnectWebSocket();
+		} else {
+			// Not connected, so connect
+			this.connectWebSocket();
+		}
 	}
 
 	private validateWebSocketSettings(): boolean {
@@ -537,17 +570,27 @@ class SyncSettingTab extends PluginSettingTab {
 		
 		const instructions = containerEl.createEl('div');
 		instructions.innerHTML = `
-			<p>1. Enter your WebSocket URL above (get this from your SST deployment output)</p>
-			<p>2. Use the Command Palette (Ctrl/Cmd+P) to access sync commands:</p>
+			<p><strong>Quick Start:</strong></p>
+			<ol>
+				<li>Enter your WebSocket URL above (get this from your SST deployment output)</li>
+				<li><strong>Click the sync status indicator</strong> in the status bar to toggle sync on/off</li>
+			</ol>
+			
+			<p><strong>Status Indicators:</strong></p>
 			<ul>
-				<li><strong>Sync: Upload active file to cloud</strong> - Upload the currently open file</li>
-				<li><strong>Sync: Download active file from cloud</strong> - Download and replace the currently open file</li>
-				<li><strong>Sync: List files in cloud</strong> - Show all files available in the cloud</li>
-				<li><strong>Sync: Connect to real-time sync</strong> - Connect to the real-time sync service</li>
-				<li><strong>Sync: Disconnect from real-time sync</strong> - Disconnect from the real-time sync service</li>
-				<li><strong>Sync: Toggle automatic file watching</strong> - Toggle automatic file watching</li>
+				<li>🟢 <strong>Connected</strong> - Real-time sync active, files sync automatically</li>
+				<li>🔴 <strong>Disconnected</strong> - Sync off, click to connect</li>
+				<li>🔵 <strong>Syncing</strong> - Processing file operations</li>
+				<li>🟡 <strong>Error</strong> - Connection issues, click to retry</li>
 			</ul>
-			<p>3. The status bar at the bottom shows the current sync status</p>
+
+			<p><strong>Advanced Commands (Ctrl/Cmd+P):</strong></p>
+			<ul>
+				<li><strong>Sync: Upload active file to cloud</strong> - Manual upload of current file</li>
+				<li><strong>Sync: Download active file from cloud</strong> - Manual download of current file</li>
+				<li><strong>Sync: List files in cloud</strong> - Show all files available in the cloud</li>
+				<li><strong>Sync: Toggle automatic file watching</strong> - Enable/disable auto-sync on file changes</li>
+			</ul>
 		`;
 	}
 }
