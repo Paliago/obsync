@@ -1,0 +1,21 @@
+{
+  "name": "@obsync/backend",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "sst shell vitest"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.751.0",
+    "@aws-sdk/client-s3": "^3.750.0",
+    "@aws-sdk/lib-dynamodb": "^3.751.0",
+    "@aws-sdk/lib-storage": "^3.750.0",
+    "@aws-sdk/s3-request-presigner": "^3.750.0",
+    "sst": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8",
+    "vitest": "catalog:"
+  }
+}

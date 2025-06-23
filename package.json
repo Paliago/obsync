@@ -1,0 +1,29 @@
+{
+  "name": "obsync",
+  "version": "0.0.0",
+  "workspaces": {
+    "packages": [
+      "packages/*"
+    ],
+    "catalog": {
+      "sst": "3.17.6",
+      "zod": "^3.24.2",
+      "tsx": "^4",
+      "vitest": "^2",
+      "@openauthjs/openauth": "^0.4.3",
+      "@types/node": "^22"
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.0.0",
+    "@tsconfig/node22": "^22",
+    "@types/aws-lambda": "8.10.150",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "volta": {
+    "node": "22.16.0"
+  }
+}

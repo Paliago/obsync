@@ -1,0 +1,17 @@
+{
+  "name": "@obsync/plugin",
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "test": "sst shell vitest"
+  },
+  "dependencies": {
+    "sst": "catalog:",
+    "zod": "catalog:",
+    "esbuild": "0.17.3",
+    "obsidian": "latest"
+  },
+  "devDependencies": {
+    "vitest": "catalog:"
+  }
+}
