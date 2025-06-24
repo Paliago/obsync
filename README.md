@@ -1,282 +1,213 @@
-# 🚀 Obsync - Personal Obsidian Sync Engine
+# Obsidian MD Sync Engine
 
-A **real-time, self-hosted sync solution** for Obsidian.md built on AWS infrastructure. This project provides a complete sync engine with WebSocket-based real-time synchronization, bulk operations, and smart conflict detection.
+A personal, self-hosted Obsidian.md sync engine that runs on AWS. This project provides real-time synchronization of your Obsidian vault across multiple devices using WebSockets, with intelligent conflict resolution and offline support.
 
-## ✨ Features
+## 🚀 Features
 
-### 🔄 **Real-time Sync**
-- **WebSocket-based** live synchronization 
-- **Automatic file watching** with debouncing
-- **Instant updates** across multiple clients
-- **Connection resilience** with auto-reconnect
-
-### 📦 **Bulk Operations**
-- **Smart Sync** - Bidirectional sync (upload newer, download missing)
-- **Upload All** - Sync all modified files to cloud
-- **Download Vault** - Download entire vault from cloud
-- **Sync Status Check** - Compare local vs cloud files
-
-### 🎯 **User Experience**
-- **Clickable status indicator** in Obsidian status bar
-- **Progress tracking** during bulk operations  
-- **Out-of-sync warnings** with ⚠️ visual indicators
-- **Detailed sync reports** with file-by-file breakdown
-
-### 🗑️ **File Management**
-- **Delete synchronization** - Local deletes propagate to cloud
-- **Soft delete with TTL** - 30-day recovery period
-- **Version tracking** with timestamps
+- **Real-time Sync**: WebSocket-based synchronization with instant file updates
+- **Intelligent Conflict Resolution**: User-controlled conflict resolution with content preview
+- **Offline Support**: Queue-based sync when reconnecting
+- **Bulk Operations**: Smart sync, upload all, download all operations
+- **File Type Support**: Markdown, images, PDFs, and all other file types
+- **Visual Status**: Status bar indicators showing sync state
+- **Auto-sync**: Configurable automatic synchronization
+- **Debounced Saves**: Efficient handling of rapid file changes
 
 ## 🏗️ Architecture
 
-```mermaid
-graph TB
-    subgraph "Obsidian Client"
-        Plugin[Plugin JS]
-        Vault[Local Vault Files]
-        StatusBar[Status Bar UI]
-        Plugin --> Vault
-        Plugin --> StatusBar
-    end
+- **Backend**: AWS Lambda + API Gateway WebSocket + S3 + DynamoDB (deployed with SST)
+- **Plugin**: TypeScript Obsidian plugin with real-time WebSocket connection
+- **Infrastructure**: Serverless, pay-per-use AWS services
 
-    subgraph "AWS Infrastructure"
-        subgraph "API Gateway"
-            WSApi[WebSocket API<br/>wss://xxx.execute-api.eu-north-1.amazonaws.com]
-        end
-        
-        subgraph "Lambda Functions"
-            ConnectLambda[Connect Handler<br/>websocket/connect.ts]
-            DisconnectLambda[Disconnect Handler<br/>websocket/disconnect.ts] 
-            MessageLambda[Message Handler<br/>websocket/message.ts]
-        end
-        
-        subgraph "Storage Layer"
-            S3[S3 Bucket<br/>File Storage]
-            DynamoDB[(DynamoDB Table<br/>Metadata & Connections)]
-        end
-    end
+## 📋 Prerequisites
 
-    %% Client to AWS
-    Plugin -.->|WebSocket Connection| WSApi
-    WSApi --> ConnectLambda
-    WSApi --> DisconnectLambda
-    WSApi --> MessageLambda
+- Node.js 18+ or Bun
+- AWS CLI configured with appropriate permissions
+- Obsidian desktop app
 
-    %% Lambda to Storage
-    ConnectLambda --> DynamoDB
-    DisconnectLambda --> DynamoDB
-    MessageLambda --> S3
-    MessageLambda --> DynamoDB
+## 🚀 Quick Start
 
-    %% Data Flow
-    Plugin -->|upload/download/delete| MessageLambda
-    MessageLambda -->|broadcast changes| Plugin
-    S3 -->|file content| Plugin
-    DynamoDB -->|file versions & connections| Plugin
+### 1. Deploy Backend Infrastructure
 
-    %% Styling
-    classDef client fill:#e1f5fe
-    classDef aws fill:#fff3e0
-    classDef storage fill:#f3e5f5
-    classDef lambda fill:#e8f5e8
-    
-    class Plugin,Vault,StatusBar client
-    class WSApi,ConnectLambda,DisconnectLambda,MessageLambda aws
-    class S3,DynamoDB storage
-```
-
-### 🔧 **Core Components**
-
-#### **Frontend (Obsidian Plugin)**
-- **WebSocket Client** - Maintains persistent connection
-- **File Watcher** - Detects local file changes  
-- **Sync Manager** - Handles bulk operations and queuing
-- **UI Components** - Status bar, progress indicators, command palette
-
-#### **Backend (AWS Lambda)**
-- **Connect Handler** - Manages WebSocket connections in DynamoDB
-- **Message Handler** - Processes upload/download/delete/list operations
-- **Disconnect Handler** - Cleans up connection state
-
-#### **Storage**
-- **S3 Bucket** - Stores actual file content with versioning
-- **DynamoDB** - Stores file metadata, versions, and active connections
-- **TTL Support** - Automatic cleanup of deleted files after 30 days
-
-## 🚀 Getting Started
-
-### **Prerequisites**
-- [Bun](https://bun.sh) runtime
-- AWS Account with CLI configured
-- [SST](https://sst.dev) for infrastructure
-
-### **1. Clone & Install**
 ```bash
-git clone <your-repo>
+# Clone the repository
+git clone <your-repo-url>
 cd obsync
+
+# Install dependencies
 bun install
+
+# Deploy to AWS (requires AWS CLI configured)
+bun sst deploy
+
+# Note the WebSocket URL from the deployment output
 ```
 
-### **2. Deploy Infrastructure**
+### 2. Install Plugin
+
+#### Method 1: Manual Installation (Recommended)
 ```bash
-# Development deployment
-bun sst dev
+# Build the plugin
+bun run deploy-plugin
 
-# Production deployment  
-bun sst deploy --stage production
+# Copy the built files to your Obsidian vault
+cp packages/plugin/main.js /path/to/your/vault/.obsidian/plugins/obsync/
+cp packages/plugin/manifest.json /path/to/your/vault/.obsidian/plugins/obsync/
 ```
 
-### **3. Build Plugin**
+#### Method 2: Development Installation
 ```bash
-cd packages/plugin
-bun run build
+# Symlink for development
+ln -s $(pwd)/packages/plugin /path/to/your/vault/.obsidian/plugins/obsync
 ```
 
-### **4. Install Plugin in Obsidian**
-1. Copy `packages/plugin/main.js` and `packages/plugin/manifest.json` 
-2. Place in `.obsidian/plugins/obsync/` in your vault
-3. Enable plugin in Obsidian settings
-4. Configure WebSocket URL from SST output
+### 3. Configure Plugin
 
-### **5. Configure & Connect**
-1. Open plugin settings in Obsidian
-2. Enter WebSocket URL: `wss://xxx.execute-api.region.amazonaws.com/$default`
-3. Click the status bar indicator to connect
-4. Start syncing! 🎉
+1. Open Obsidian
+2. Go to Settings → Community Plugins
+3. Enable "Obsidian Sync Engine"
+4. In plugin settings, enter your WebSocket URL from step 1
+5. Click the sync status indicator in the status bar to connect
 
-## 📱 Usage
+## 🔧 Configuration
 
-### **Quick Sync**
-- **Click status bar** - Toggle sync on/off instantly
-- **File watching** - Auto-sync when files change (2s debounce)
-- **Status indicators** - 🟢 Connected, 🔴 Disconnected, 🔵 Syncing, 🟡 Error
+### Plugin Settings
 
-### **Bulk Operations (Ctrl/Cmd+P)**
-- `Sync: Smart sync (upload newer, download missing)` ⭐ **RECOMMENDED**
+- **WebSocket URL**: Your deployed AWS WebSocket endpoint
+- **Username/Password**: For future authentication (currently unused)
+- **Enable Auto-Sync**: Automatic sync every 30 seconds
+- **Sync All File Types**: Include images, PDFs, etc. (not just markdown)
+
+### Status Indicators
+
+- 🟢 **Connected**: Real-time sync active
+- 🔴 **Disconnected**: Click to connect
+- 🔵 **Syncing**: Processing operations
+- 🟡 **Error**: Connection issues
+
+## 🎯 Usage
+
+### Real-time Sync
+Once connected, files are automatically synchronized as you type and save. The system uses intelligent debouncing to avoid excessive network requests.
+
+### Commands (Ctrl/Cmd + P)
+
+**Recommended Commands:**
+- `Sync: Smart sync` - ⭐ Bidirectional sync with conflict resolution
+- `Sync: Toggle auto-sync` - Enable/disable automatic sync
+
+**Bulk Operations:**
 - `Sync: Upload all files to cloud` - One-way upload
-- `Sync: Download entire vault from cloud` - One-way download  
-- `Sync: Check which files are out of sync` - Detailed report
+- `Sync: Download entire vault from cloud` - One-way download
+- `Sync: Check which files are out of sync` - Status check
 
-### **Individual Files**
-- `Sync: Upload active file to cloud`
-- `Sync: Download active file from cloud`
-- `Sync: List files in cloud`
+**Individual File Commands:**
+- `Sync: Upload active file` - Manual upload current file
+- `Sync: Download active file` - Manual download current file
 
-## 🔍 Monitoring & Debugging
+### Conflict Resolution
 
-### **Console Logs**
-The plugin logs detailed information to browser console:
-```javascript
-// Open DevTools in Obsidian (Ctrl+Shift+I)
-// Look for sync status, file operations, and error messages
-```
+When conflicts are detected (both local and cloud versions have changed), a modal dialog will appear:
 
-### **SST Dashboard** 
-```bash
-# View logs and metrics
-bun sst dev  # Keep this running for live logs
-```
+1. **File Information**: Shows modification timestamps
+2. **Content Preview**: Displays local and cloud content (for text files)
+3. **User Choice**: 
+   - "Keep Local Version" - Upload your local changes
+   - "Use Cloud Version" - Download the cloud version
 
-### **Status Reports**
-Use "Check sync status" command for detailed file comparison:
-- 📝 **Modified locally** - Files changed since last sync
-- 📤 **Local only** - Files not yet uploaded
-- 📥 **Cloud only** - Files not downloaded locally
+## 🛠️ Development
 
-## 🏗️ Development
-
-### **Project Structure**
+### Project Structure
 ```
 obsync/
 ├── packages/
 │   ├── backend/          # AWS Lambda functions
-│   │   └── src/websocket/
-│   │       ├── connect.ts    # WebSocket connection handler
-│   │       ├── disconnect.ts # WebSocket disconnection handler  
-│   │       └── message.ts    # File operations handler
+│   │   └── src/
+│   │       ├── websocket/  # WebSocket handlers
+│   │       ├── connect.ts
+│   │       ├── disconnect.ts
+│   │       └── message.ts
 │   └── plugin/           # Obsidian plugin
-│       ├── src/main.ts       # Plugin main logic
-│       ├── manifest.json     # Plugin metadata
-│       └── main.js          # Built plugin (generated)
-├── sst.config.ts         # Infrastructure as code
+│       └── src/
+│           └── main.ts   # Plugin implementation
+├── sst.config.ts         # Infrastructure config
 └── README.md
 ```
 
-### **Local Development**
+### Local Development
+
 ```bash
-# Start SST development
+# Start SST development environment
 bun sst dev
 
-# Build plugin (in another terminal)
-cd packages/plugin
-bun run dev  # Watch mode
+# Build plugin for testing
+bun run deploy-plugin
 
-# Test changes in Obsidian by reloading plugin
+# Watch plugin changes
+cd packages/plugin
+bun run dev
 ```
 
-### **Key Files**
-- **`sst.config.ts`** - Defines AWS infrastructure  
-- **`packages/plugin/src/main.ts`** - Main plugin logic
-- **`packages/backend/src/websocket/message.ts`** - Core sync logic
+### Plugin Development
 
-## 🔒 Security & Production
+The plugin uses modern Obsidian APIs:
+- WebSocket for real-time communication
+- Vault API for file operations
+- Modal API for conflict resolution
+- Settings API for configuration
 
-### **Current Status**
-- ✅ **WebSocket Security** - AWS API Gateway handles SSL/TLS
-- ✅ **Soft Deletes** - 30-day recovery period with TTL
-- ⚠️ **Authentication** - Currently no auth (single user)
-- ⚠️ **Access Control** - Files are accessible to anyone with URLs
+## 🔒 Security
 
-### **Roadmap**
-- [ ] Add authentication/authorization
-- [ ] User isolation and access controls
-- [ ] Encryption at rest and in transit
-- [ ] Rate limiting and abuse prevention
+- Lambda functions have minimal IAM permissions
+- S3 bucket access restricted to specific paths
+- DynamoDB access limited to required operations
+- WebSocket connections use secure WSS protocol
 
-## 📊 Metrics & Monitoring
+## 📊 Monitoring
 
-### **Current Capabilities**
-- **Connection tracking** in DynamoDB
-- **File operation logs** in CloudWatch
-- **Real-time status** in Obsidian UI
-- **Detailed sync reports** with file-level breakdown
+- CloudWatch logs for Lambda functions
+- WebSocket connection tracking in DynamoDB
+- Plugin debug logs in Obsidian Developer Console
 
-### **Performance**
-- **Batched operations** - 3 files per batch, 500ms delays
-- **Debounced file watching** - 2-second delays prevent spam
-- **Connection resilience** - Exponential backoff (max 5 attempts, 30s delay)
+## 🐛 Troubleshooting
 
-## 🆘 Troubleshooting
+### Connection Issues
+1. Verify WebSocket URL is correct
+2. Check AWS CloudWatch logs
+3. Ensure AWS credentials have proper permissions
 
-### **Connection Issues**
-- Check WebSocket URL in settings
-- Verify AWS credentials and permissions
-- Look for error messages in browser console
+### Sync Problems
+1. Use "Check sync status" command to diagnose
+2. Try "Smart sync" to resolve discrepancies
+3. Check Obsidian Developer Console for errors
 
-### **Sync Problems**  
-- Use "Check sync status" for detailed diagnostics
-- Check CloudWatch logs for Lambda errors
-- Verify S3 bucket permissions
+### File Conflicts
+1. Conflict resolution modal should appear automatically
+2. Use content preview to make informed decisions
+3. Both choices are safe - no data loss occurs
 
-### **Plugin Issues**
-- Reload plugin in Obsidian settings
-- Check for JavaScript errors in DevTools
-- Ensure `main.js` is built and up-to-date
+## 📈 Performance
+
+- Efficient chunking for large files (>28KB)
+- Debounced file watching to reduce API calls
+- Batched operations for bulk sync
+- Auto-reconnection with exponential backoff
 
 ## 🤝 Contributing
 
-This is a personal project, but feedback and suggestions are welcome!
+This is a personal project, but contributions are welcome:
 
-### **Built With**
-- **Frontend**: TypeScript, Obsidian API
-- **Backend**: AWS Lambda, TypeScript  
-- **Infrastructure**: SST, AWS (API Gateway, S3, DynamoDB)
-- **Tooling**: Bun, esbuild
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
 
----
+## 📄 License
 
-<div align="center">
+MIT License - see LICENSE file for details
 
-**⚡ Built with [SST](https://sst.dev) and [Bun](https://bun.sh) ⚡**
+## 🔗 Related Projects
 
-</div>
+- [Obsidian](https://obsidian.md/) - The knowledge management app
+- [SST](https://sst.dev/) - Modern AWS infrastructure framework

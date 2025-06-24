@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, Modal } from 'obsidian';
 
 interface SyncSettings {
 	username: string;
@@ -8,6 +8,24 @@ interface SyncSettings {
 	autoSyncEnabled: boolean;
 	syncAllFileTypes: boolean;
 	lastModifiedTimes: Record<string, number>;
+	debounceDelay: number;
+	autoSyncInterval: number;
+	instantSyncMode: boolean;
+	// File filtering
+	useWhitelist: boolean;
+	extensionWhitelist: string[];
+	extensionBlacklist: string[];
+	excludedFolders: string[];
+	// Performance settings
+	chunkSizeKB: number;
+	batchSize: number;
+	maxRetryAttempts: number;
+	operationTimeoutMs: number;
+	maxFileSizeMB: number;
+	fileSizeWarningMB: number;
+	// Debug settings
+	enableDebugLogging: boolean;
+	showPerformanceMetrics: boolean;
 }
 
 const DEFAULT_SETTINGS: SyncSettings = {
@@ -17,7 +35,25 @@ const DEFAULT_SETTINGS: SyncSettings = {
 	websocketUrl: '',
 	autoSyncEnabled: true,
 	syncAllFileTypes: true,
-	lastModifiedTimes: {}
+	lastModifiedTimes: {},
+	debounceDelay: 2000,
+	autoSyncInterval: 30000,
+	instantSyncMode: false,
+	// File filtering
+	useWhitelist: false,
+	extensionWhitelist: ['md', 'txt', 'pdf', 'png', 'jpg', 'jpeg'],
+	extensionBlacklist: ['tmp', 'log', 'cache', 'DS_Store'],
+	excludedFolders: ['.obsidian', '.trash', '.git'],
+	// Performance settings
+	chunkSizeKB: 28,
+	batchSize: 3,
+	maxRetryAttempts: 5,
+	operationTimeoutMs: 10000,
+	maxFileSizeMB: 100,
+	fileSizeWarningMB: 5,
+	// Debug settings
+	enableDebugLogging: false,
+	showPerformanceMetrics: false
 }
 
 interface WebSocketMessage {
@@ -50,13 +86,28 @@ interface ChunkBuffer {
 	lastModified?: number;
 }
 
+interface ConflictFile {
+	filePath: string;
+	localModified: number;
+	cloudModified: number;
+	localContent?: string;
+	cloudContent?: string;
+}
+
+interface ConflictResolution {
+	filePath: string;
+	choice: 'local' | 'cloud';
+}
+
 export default class ObsidianSyncPlugin extends Plugin {
 	settings!: SyncSettings;
 	statusBarItem!: HTMLElement;
 	ws: WebSocket | null = null;
 	isConnecting: boolean = false;
 	reconnectAttempts: number = 0;
-	maxReconnectAttempts: number = 5;
+	get maxReconnectAttempts() { 
+		return this.settings.maxRetryAttempts; 
+	}
 	reconnectTimeout: NodeJS.Timeout | null = null;
 	fileWatchingEnabled: boolean = true;
 	lastModifiedTimes: Map<string, number> = new Map();
@@ -78,7 +129,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 	
 	// Chunking support
 	private chunkBuffers: Map<string, ChunkBuffer> = new Map();
-	private readonly MAX_CHUNK_SIZE = 28000; // ~28KB, leaving some room for JSON overhead
+	private get MAX_CHUNK_SIZE() { 
+		return this.settings.chunkSizeKB * 1000; // Convert KB to bytes, leaving room for JSON overhead
+	}
 	
 	// Debounced settings save
 	private saveSettingsTimeout: NodeJS.Timeout | null = null;
@@ -411,11 +464,13 @@ export default class ObsidianSyncPlugin extends Plugin {
 			}
 		};
 
-			this.ws.onerror = (error) => {
-				console.error('WebSocket error:', error);
-				this.isConnecting = false;
-				this.updateStatusBar('Connection Error', 'error');
-			};
+					this.ws.onerror = (error) => {
+			console.error('WebSocket error:', error);
+			this.isConnecting = false;
+			this.updateStatusBar('Connection Error', 'error');
+			new Notice('WebSocket connection error. Will retry automatically.', 5000);
+			this.scheduleReconnect();
+		};
 
 		} catch (error) {
 			console.error('Failed to create WebSocket:', error);
@@ -444,11 +499,17 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	private scheduleReconnect() {
+		if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+			this.updateStatusBar('Connection failed', 'error');
+			new Notice(`Failed to connect after ${this.maxReconnectAttempts} attempts. Click sync icon to retry manually.`, 8000);
+			return;
+		}
+
 		this.reconnectAttempts++;
 		const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000); // Exponential backoff, max 30s
 		
-		console.log(`Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`);
-		this.updateStatusBar(`Reconnecting in ${Math.ceil(delay/1000)}s...`, 'syncing');
+		console.log(`Scheduling reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
+		this.updateStatusBar(`Reconnecting ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${Math.ceil(delay/1000)}s...`, 'syncing');
 
 		this.reconnectTimeout = setTimeout(() => {
 			this.connectWebSocket();
@@ -634,7 +695,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 			// Clean up buffer
 			this.chunkBuffers.delete(bufferId);
 
-			// Handle the complete message
+			// Handle the complete message based on its type/action
 			const completeMessage: WebSocketMessage = {
 				...data,
 				content: fullContent,
@@ -692,12 +753,18 @@ export default class ObsidianSyncPlugin extends Plugin {
 
 			// Check file size and notify user if it's large
 			const fileSizeKB = Math.round(new Blob([fileContent]).size / 1024);
-			if (fileSizeKB > 32) {
-				new Notice(`Syncing large file: ${filePath} (${fileSizeKB}KB) - this may take a moment`);
-				console.log(`Large file detected: ${filePath} (${fileSizeKB}KB) - will be chunked`);
+			const fileSizeMB = fileSizeKB / 1024;
+			
+			if (fileSizeMB > this.settings.fileSizeWarningMB) {
+				new Notice(`Syncing large file: ${filePath} (${fileSizeMB.toFixed(1)}MB) - this may take a moment`);
+				if (this.settings.enableDebugLogging) {
+					console.log(`Large file detected: ${filePath} (${fileSizeKB}KB) - will be chunked`);
+				}
 			}
 
+			if (this.settings.enableDebugLogging) {
 			console.log(`Uploading file: ${filePath} (type: ${fileType})`);
+		}
 			
 			const success = this.sendWebSocketMessage({
 				action: 'upload',
@@ -727,25 +794,37 @@ export default class ObsidianSyncPlugin extends Plugin {
 	downloadFile(filePath: string) {
 		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
 			new Notice('Not connected to real-time sync');
-			return;
+			return false;
 		}
 
-		this.updateStatusBar('Downloading...', 'syncing');
-		
-		const success = this.sendWebSocketMessage({
-			action: 'download',
-			filePath: filePath
-		});
+		try {
+			this.updateStatusBar('Downloading...', 'syncing');
+			
+			const success = this.sendWebSocketMessage({
+				action: 'download',
+				filePath: filePath
+			});
 
-		if (success) {
-			console.log(`Downloading file: ${filePath}`);
-		}
-
-		setTimeout(() => {
-			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-				this.updateStatusBar('Connected', 'connected');
+			if (success) {
+				console.log(`Downloading file: ${filePath}`);
+			} else {
+				new Notice(`Failed to request download for: ${filePath}`);
+				return false;
 			}
-		}, 2000);
+
+			// Set timeout to detect if download fails
+			setTimeout(() => {
+				if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+					this.updateStatusBar('Connected', 'connected');
+				}
+			}, this.settings.operationTimeoutMs);
+
+			return true;
+		} catch (error) {
+			console.error(`Error downloading file ${filePath}:`, error);
+			new Notice(`Failed to download ${filePath}: ${(error as any).message}`);
+			return false;
+		}
 	}
 
 	private async applyFileContent(filePath: string, content: string, fileType: string = 'text') {
@@ -995,17 +1074,23 @@ export default class ObsidianSyncPlugin extends Plugin {
 			return;
 		}
 
+		// If instant sync mode is enabled, sync immediately
+		if (this.settings.instantSyncMode) {
+			this.uploadFile(file.path);
+			return;
+		}
+
 		// Clear existing timeout for this file
 		const existingTimeout = this.debounceTimeouts.get(file.path);
 		if (existingTimeout) {
 			clearTimeout(existingTimeout);
 		}
 
-		// Set new timeout
+		// Set new timeout with configurable delay
 		const timeout = setTimeout(() => {
 			this.uploadFile(file.path);
 			this.debounceTimeouts.delete(file.path);
-		}, 2000); // 2 second debounce
+		}, this.settings.debounceDelay);
 
 		this.debounceTimeouts.set(file.path, timeout);
 	}
@@ -1228,6 +1313,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 		const localFiles = this.getAllLocalFiles().filter(file => this.shouldSyncFile(file));
 		const filesToUpload: TFile[] = [];
 		const filesToDownload: string[] = [];
+		const conflicts: ConflictFile[] = [];
 
 		console.log('=== SMART SYNC ANALYSIS ===');
 
@@ -1241,16 +1327,28 @@ export default class ObsidianSyncPlugin extends Plugin {
 			} else {
 				// Extract cloud timestamp info
 				const cloudLastModified = typeof cloudFileInfo === 'string' ? 0 : (cloudFileInfo.clientLastModified || cloudFileInfo.lastModified || 0);
-				
-				// Check if file has been modified since last sync or is newer than cloud version
 				const lastKnownTime = this.lastModifiedTimes.get(file.path);
-				const fileNeedsSync = !lastKnownTime || file.stat.mtime > lastKnownTime;
-				const localIsNewer = file.stat.mtime > cloudLastModified;
 				
-				if (fileNeedsSync || localIsNewer) {
-					// File was modified locally or is newer than cloud, upload it
+				// Detect true conflicts: both local and cloud have been modified since last sync
+				const localModified = file.stat.mtime > (lastKnownTime || 0);
+				const cloudModified = cloudLastModified > (lastKnownTime || 0);
+				
+				if (localModified && cloudModified && file.stat.mtime !== cloudLastModified) {
+					// True conflict: both sides have changes
+					conflicts.push({
+						filePath: file.path,
+						localModified: file.stat.mtime,
+						cloudModified: cloudLastModified
+					});
+					console.log(`⚠️ CONFLICT: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`);
+				} else if (localModified || file.stat.mtime > cloudLastModified) {
+					// Local is newer or only local has changes, upload it
 					filesToUpload.push(file);
 					console.log(`📤 WILL UPLOAD: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`);
+				} else if (cloudModified || cloudLastModified > file.stat.mtime) {
+					// Cloud is newer or only cloud has changes, download it
+					filesToDownload.push(file.path);
+					console.log(`📥 WILL DOWNLOAD: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`);
 				}
 			}
 		});
@@ -1264,6 +1362,61 @@ export default class ObsidianSyncPlugin extends Plugin {
 			}
 		});
 
+		// Handle conflicts first if any exist
+		if (conflicts.length > 0) {
+			console.log(`Found ${conflicts.length} conflicts, showing resolution dialog...`);
+			
+			// Load content for text file conflicts to show preview
+			for (const conflict of conflicts) {
+				const localFile = localFiles.find(f => f.path === conflict.filePath);
+				if (localFile && this.getFileType(localFile) === 'text') {
+					try {
+						conflict.localContent = await this.app.vault.read(localFile);
+						// Get cloud content - we'll need to fetch it
+						// For now, we'll resolve conflicts without content preview
+						// This could be enhanced later by fetching cloud content
+					} catch (error) {
+						console.error(`Failed to read local file ${conflict.filePath}:`, error);
+					}
+				}
+			}
+
+			// Show conflict resolution modal
+			const modal = new ConflictResolutionModal(
+				this.app,
+				this,
+				conflicts,
+				async (resolutions: ConflictResolution[]) => {
+					// Process conflict resolutions
+					for (const resolution of resolutions) {
+						if (resolution.choice === 'local') {
+							// User chose to keep local version - upload it
+							const localFile = localFiles.find(f => f.path === resolution.filePath);
+							if (localFile) {
+								filesToUpload.push(localFile);
+								console.log(`🔄 CONFLICT RESOLVED: Will upload ${resolution.filePath} (keep local)`);
+							}
+						} else {
+							// User chose to use cloud version - download it
+							filesToDownload.push(resolution.filePath);
+							console.log(`🔄 CONFLICT RESOLVED: Will download ${resolution.filePath} (use cloud)`);
+						}
+					}
+
+					// Continue with normal sync after resolving conflicts
+					await this.executeSyncOperations(filesToUpload, filesToDownload);
+				}
+			);
+			
+			modal.open();
+			return; // Exit early, modal callback will continue the sync
+		}
+
+		// No conflicts, proceed with normal sync
+		await this.executeSyncOperations(filesToUpload, filesToDownload);
+	}
+
+	private async executeSyncOperations(filesToUpload: TFile[], filesToDownload: string[]) {
 		const totalOperations = filesToUpload.length + filesToDownload.length;
 		if (totalOperations === 0) {
 			new Notice('✅ All files are already in sync');
@@ -1276,7 +1429,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 		console.log(`Smart sync: ${filesToUpload.length} uploads, ${filesToDownload.length} downloads`);
 
 		// Process uploads first (in batches)
-		const batchSize = 3;
+		const batchSize = this.settings.batchSize;
 		for (let i = 0; i < filesToUpload.length; i += batchSize) {
 			const batch = filesToUpload.slice(i, i + batchSize);
 			
@@ -1339,9 +1492,20 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	private shouldSyncFile(file: TFile): boolean {
-		// Skip excluded extensions
 		const ext = file.extension.toLowerCase();
-		if (this.excludedExtensions.has(`.${ext}`)) {
+		
+		// Check excluded folders
+		for (const folder of this.settings.excludedFolders) {
+			if (file.path.startsWith(folder + '/') || file.path === folder) {
+				return false;
+			}
+		}
+		
+		// Check file size limits
+		if (file.stat.size > this.settings.maxFileSizeMB * 1024 * 1024) {
+			if (this.settings.enableDebugLogging) {
+				console.log(`Skipping ${file.path}: exceeds max file size (${Math.round(file.stat.size / 1024 / 1024)}MB)`);
+			}
 			return false;
 		}
 
@@ -1350,11 +1514,15 @@ export default class ObsidianSyncPlugin extends Plugin {
 			return false;
 		}
 
-		// Skip files in .obsidian folder and other system folders
-		if (file.path.startsWith('.obsidian/') || 
-			file.path.startsWith('.trash/') || 
-			file.path.startsWith('.git/')) {
-			return false;
+		// If sync all file types is enabled, use whitelist/blacklist logic
+		if (this.settings.syncAllFileTypes) {
+			if (this.settings.useWhitelist) {
+				// Whitelist mode: only sync files with extensions in the whitelist
+				return this.settings.extensionWhitelist.includes(ext);
+			} else {
+				// Blacklist mode: sync all files except those in the blacklist
+				return !this.settings.extensionBlacklist.includes(ext);
+			}
 		}
 
 		return true;
@@ -1396,14 +1564,14 @@ export default class ObsidianSyncPlugin extends Plugin {
 			return;
 		}
 
-		// Start auto sync every 30 seconds
+		// Start auto sync with configurable interval
 		this.autoSyncInterval = setInterval(() => {
 			if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.isAutoSyncing && !this.isBulkSyncing) {
 				this.performAutoSync();
 			}
-		}, 30000);
+		}, this.settings.autoSyncInterval);
 
-		console.log('Auto-sync started');
+		console.log(`Auto-sync started with ${this.settings.autoSyncInterval}ms interval`);
 	}
 
 	stopAutoSync() {
@@ -1568,11 +1736,51 @@ class SyncSettingTab extends PluginSettingTab {
 				text.inputEl.type = 'password';
 			});
 
-		containerEl.createEl('h3', {text: 'Sync Settings'});
+		containerEl.createEl('h3', {text: 'Real-time Sync (File Watching)'});
+		
+		const realtimeDesc = containerEl.createEl('p', {
+			text: 'Files are automatically synced when you edit them (always enabled when connected)'
+		});
+		realtimeDesc.style.color = 'var(--text-muted)';
+		realtimeDesc.style.fontSize = '0.9em';
+		realtimeDesc.style.marginBottom = '20px';
 
 		new Setting(containerEl)
-			.setName('Enable Auto-Sync')
-			.setDesc('Automatically sync files when connected (checks every 30 seconds)')
+			.setName('Instant Sync Mode')
+			.setDesc('Sync files immediately when changed (no delay)')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.instantSyncMode)
+				.onChange(async (value) => {
+					this.plugin.settings.instantSyncMode = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Debounce Delay (ms)')
+			.setDesc('Delay before syncing after you stop typing (ignored in instant mode)')
+			.addText(text => text
+				.setPlaceholder('2000')
+				.setValue(this.plugin.settings.debounceDelay.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 2000;
+					if (numValue >= 100 && numValue <= 30000) {
+						this.plugin.settings.debounceDelay = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		containerEl.createEl('h3', {text: 'Background Auto-Sync'});
+		
+		const autoSyncDesc = containerEl.createEl('p', {
+			text: 'Periodic background sync checks (separate from real-time file watching above)'
+		});
+		autoSyncDesc.style.color = 'var(--text-muted)';
+		autoSyncDesc.style.fontSize = '0.9em';
+		autoSyncDesc.style.marginBottom = '20px';
+
+		new Setting(containerEl)
+			.setName('Enable Background Auto-Sync')
+			.setDesc('Automatically run sync checks in the background at regular intervals')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.autoSyncEnabled)
 				.onChange(async (value) => {
@@ -1588,12 +1796,185 @@ class SyncSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
+			.setName('Auto-Sync Interval (seconds)')
+			.setDesc('How often to run background sync checks')
+			.addText(text => text
+				.setPlaceholder('30')
+				.setValue((this.plugin.settings.autoSyncInterval / 1000).toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 30;
+					if (numValue >= 5 && numValue <= 600) {
+						this.plugin.settings.autoSyncInterval = numValue * 1000;
+						await this.plugin.saveSettings();
+						
+						// Restart auto-sync with new interval
+						if (this.plugin.settings.autoSyncEnabled && this.plugin.ws && this.plugin.ws.readyState === WebSocket.OPEN) {
+							this.plugin.stopAutoSync();
+							this.plugin.startAutoSync();
+						}
+					}
+				}));
+
+		containerEl.createEl('h3', {text: 'File Filtering'});
+
+		new Setting(containerEl)
 			.setName('Sync All File Types')
-			.setDesc('Sync all file types (images, PDFs, etc.), not just markdown files')
+			.setDesc('Enable syncing of all file types (not just markdown)')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.syncAllFileTypes)
 				.onChange(async (value) => {
 					this.plugin.settings.syncAllFileTypes = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Use Extension Whitelist')
+			.setDesc('When enabled, only sync files with extensions in the whitelist. When disabled, sync all except blacklisted extensions.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.useWhitelist)
+				.onChange(async (value) => {
+					this.plugin.settings.useWhitelist = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Extension Whitelist')
+			.setDesc('Comma-separated list of file extensions to sync (e.g., md,txt,pdf)')
+			.addText(text => text
+				.setPlaceholder('md,txt,pdf,png,jpg')
+				.setValue(this.plugin.settings.extensionWhitelist.join(','))
+				.onChange(async (value) => {
+					this.plugin.settings.extensionWhitelist = value.split(',').map(ext => ext.trim().toLowerCase());
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Extension Blacklist')
+			.setDesc('Comma-separated list of file extensions to exclude from sync')
+			.addText(text => text
+				.setPlaceholder('tmp,log,cache')
+				.setValue(this.plugin.settings.extensionBlacklist.join(','))
+				.onChange(async (value) => {
+					this.plugin.settings.extensionBlacklist = value.split(',').map(ext => ext.trim().toLowerCase());
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Excluded Folders')
+			.setDesc('Comma-separated list of folder paths to exclude from sync')
+			.addText(text => text
+				.setPlaceholder('.obsidian,.trash,.git')
+				.setValue(this.plugin.settings.excludedFolders.join(','))
+				.onChange(async (value) => {
+					this.plugin.settings.excludedFolders = value.split(',').map(folder => folder.trim());
+					await this.plugin.saveSettings();
+				}));
+
+		containerEl.createEl('h3', {text: 'Performance & Limits'});
+
+		new Setting(containerEl)
+			.setName('Chunk Size (KB)')
+			.setDesc('File size threshold for chunking large files')
+			.addText(text => text
+				.setPlaceholder('28')
+				.setValue(this.plugin.settings.chunkSizeKB.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 28;
+					if (numValue >= 1 && numValue <= 1024) {
+						this.plugin.settings.chunkSizeKB = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Batch Size')
+			.setDesc('Number of files to process simultaneously during bulk operations')
+			.addText(text => text
+				.setPlaceholder('3')
+				.setValue(this.plugin.settings.batchSize.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 3;
+					if (numValue >= 1 && numValue <= 20) {
+						this.plugin.settings.batchSize = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Max File Size (MB)')
+			.setDesc('Maximum file size allowed for sync (0 = no limit)')
+			.addText(text => text
+				.setPlaceholder('100')
+				.setValue(this.plugin.settings.maxFileSizeMB.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 100;
+					if (numValue >= 0 && numValue <= 1000) {
+						this.plugin.settings.maxFileSizeMB = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('File Size Warning (MB)')
+			.setDesc('Show warning when syncing files larger than this size')
+			.addText(text => text
+				.setPlaceholder('5')
+				.setValue(this.plugin.settings.fileSizeWarningMB.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 5;
+					if (numValue >= 0 && numValue <= 100) {
+						this.plugin.settings.fileSizeWarningMB = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Max Retry Attempts')
+			.setDesc('Maximum number of connection retry attempts')
+			.addText(text => text
+				.setPlaceholder('5')
+				.setValue(this.plugin.settings.maxRetryAttempts.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 5;
+					if (numValue >= 1 && numValue <= 20) {
+						this.plugin.settings.maxRetryAttempts = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Operation Timeout (ms)')
+			.setDesc('Timeout for upload/download operations')
+			.addText(text => text
+				.setPlaceholder('10000')
+				.setValue(this.plugin.settings.operationTimeoutMs.toString())
+				.onChange(async (value) => {
+					const numValue = parseInt(value) || 10000;
+					if (numValue >= 1000 && numValue <= 60000) {
+						this.plugin.settings.operationTimeoutMs = numValue;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		containerEl.createEl('h3', {text: 'Debug & Development'});
+
+		new Setting(containerEl)
+			.setName('Enable Debug Logging')
+			.setDesc('Show detailed console logs for troubleshooting')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableDebugLogging)
+				.onChange(async (value) => {
+					this.plugin.settings.enableDebugLogging = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Show Performance Metrics')
+			.setDesc('Display sync timing and performance information')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.showPerformanceMetrics)
+				.onChange(async (value) => {
+					this.plugin.settings.showPerformanceMetrics = value;
 					await this.plugin.saveSettings();
 				}));
 
@@ -1615,31 +1996,162 @@ class SyncSettingTab extends PluginSettingTab {
 				<li>🟡 <strong>Error</strong> - Connection issues, click to retry</li>
 			</ul>
 
-			<p><strong>🔄 Auto-Sync:</strong></p>
+			<p><strong>Three Types of Sync:</strong></p>
+			<ol>
+				<li><strong>🎯 Real-time Sync</strong> - Files sync automatically when you edit them (always on when connected)</li>
+				<li><strong>🔄 Background Auto-Sync</strong> - Periodic checks for missing/changed files (optional, configurable interval)</li>
+				<li><strong>⚡ Manual Smart Sync</strong> - Full bidirectional sync with conflict resolution (triggered via commands)</li>
+			</ol>
+
+			<p><strong>Commands (Ctrl/Cmd+P):</strong></p>
 			<ul>
-				<li>When enabled, automatically syncs files every 30 seconds</li>
-				<li>Handles missing files in both directions (upload local-only, download cloud-only)</li>
-				<li>Compares timestamps to determine which version is newer</li>
-				<li>Supports all file types (markdown, images, PDFs, etc.)</li>
-				<li>Automatically creates folders when downloading files</li>
+				<li><strong>Sync: Smart sync</strong> - ⭐ Full bidirectional sync with conflict resolution</li>
+				<li><strong>Sync: Toggle auto-sync</strong> - Enable/disable background auto-sync</li>
+				<li><strong>Sync: Check sync status</strong> - Compare local vs cloud files</li>
+				<li><strong>Sync: Upload active file</strong> - Manual upload of current file</li>
+				<li><strong>Sync: Download active file</strong> - Manual download of current file</li>
 			</ul>
 
-			<p><strong>Bulk Operations (Ctrl/Cmd+P):</strong></p>
+			<p><strong>💡 Pro Tips:</strong></p>
 			<ul>
-				<li><strong>Sync: Smart sync (upload newer, download missing)</strong> - ⭐ RECOMMENDED: Full bidirectional sync</li>
-				<li><strong>Sync: Toggle auto-sync</strong> - Enable/disable automatic syncing</li>
-				<li><strong>Sync: Upload all files to cloud</strong> - Upload only (one direction)</li>
-				<li><strong>Sync: Download entire vault from cloud</strong> - Download only (one direction)</li>
-				<li><strong>Sync: Check which files are out of sync</strong> - Compare local vs cloud files</li>
-			</ul>
-
-			<p><strong>Individual File Commands:</strong></p>
-			<ul>
-				<li><strong>Sync: Upload active file to cloud</strong> - Manual upload of current file</li>
-				<li><strong>Sync: Download active file from cloud</strong> - Manual download of current file</li>
-				<li><strong>Sync: List files in cloud</strong> - Show all files available in the cloud</li>
-				<li><strong>Sync: Toggle automatic file watching</strong> - Enable/disable real-time sync on file changes</li>
+				<li>Real-time sync handles your daily editing automatically</li>
+				<li>Enable background auto-sync for multi-device scenarios</li>
+				<li>Use Smart Sync to resolve conflicts and ensure everything is in sync</li>
+				<li>Adjust debounce delay if you want faster/slower real-time sync</li>
 			</ul>
 		`;
+	}
+}
+
+class ConflictResolutionModal extends Modal {
+	private conflicts: ConflictFile[];
+	private resolutions: ConflictResolution[] = [];
+	private currentIndex: number = 0;
+	private plugin: ObsidianSyncPlugin;
+	private onResolve: (resolutions: ConflictResolution[]) => void;
+
+	constructor(
+		app: App, 
+		plugin: ObsidianSyncPlugin,
+		conflicts: ConflictFile[], 
+		onResolve: (resolutions: ConflictResolution[]) => void
+	) {
+		super(app);
+		this.plugin = plugin;
+		this.conflicts = conflicts;
+		this.onResolve = onResolve;
+	}
+
+	onOpen() {
+		this.displayConflict();
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+
+	private displayConflict() {
+		this.contentEl.empty();
+		
+		if (this.currentIndex >= this.conflicts.length) {
+			// All conflicts resolved
+			this.close();
+			this.onResolve(this.resolutions);
+			return;
+		}
+
+		const conflict = this.conflicts[this.currentIndex];
+		const { contentEl } = this;
+
+		// Title
+		contentEl.createEl('h2', { text: 'Sync Conflict Detected' });
+		
+		// Progress indicator
+		const progressEl = contentEl.createEl('p', { 
+			text: `Conflict ${this.currentIndex + 1} of ${this.conflicts.length}` 
+		});
+		progressEl.style.color = 'var(--text-muted)';
+
+		// File path
+		contentEl.createEl('h3', { text: `File: ${conflict.filePath}` });
+
+		// Conflict explanation
+		const explanationEl = contentEl.createEl('div');
+		explanationEl.innerHTML = `
+			<p>This file has been modified both locally and in the cloud:</p>
+			<ul>
+				<li><strong>Local version:</strong> Modified ${new Date(conflict.localModified).toLocaleString()}</li>
+				<li><strong>Cloud version:</strong> Modified ${new Date(conflict.cloudModified).toLocaleString()}</li>
+			</ul>
+			<p>Choose which version to keep:</p>
+		`;
+
+		// Buttons container
+		const buttonsEl = contentEl.createEl('div');
+		buttonsEl.style.display = 'flex';
+		buttonsEl.style.gap = '10px';
+		buttonsEl.style.marginTop = '20px';
+		buttonsEl.style.justifyContent = 'center';
+
+		// Keep Local button
+		const keepLocalBtn = buttonsEl.createEl('button', { text: 'Keep Local Version' });
+		keepLocalBtn.style.padding = '10px 20px';
+		keepLocalBtn.style.backgroundColor = 'var(--interactive-accent)';
+		keepLocalBtn.style.color = 'var(--text-on-accent)';
+		keepLocalBtn.style.border = 'none';
+		keepLocalBtn.style.borderRadius = '4px';
+		keepLocalBtn.style.cursor = 'pointer';
+		
+		keepLocalBtn.onclick = () => {
+			this.resolveConflict('local');
+		};
+
+		// Use Cloud button
+		const useCloudBtn = buttonsEl.createEl('button', { text: 'Use Cloud Version' });
+		useCloudBtn.style.padding = '10px 20px';
+		useCloudBtn.style.backgroundColor = 'var(--interactive-normal)';
+		useCloudBtn.style.color = 'var(--text-normal)';
+		useCloudBtn.style.border = '1px solid var(--background-modifier-border)';
+		useCloudBtn.style.borderRadius = '4px';
+		useCloudBtn.style.cursor = 'pointer';
+		
+		useCloudBtn.onclick = () => {
+			this.resolveConflict('cloud');
+		};
+
+		// Show preview if content is available (for text files)
+		if (conflict.localContent && conflict.cloudContent) {
+			const previewEl = contentEl.createEl('div');
+			previewEl.style.marginTop = '20px';
+			
+			const localPreview = previewEl.createEl('div');
+			localPreview.innerHTML = `
+				<h4>Local Content Preview:</h4>
+				<pre style="background: var(--background-secondary); padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto;">${this.escapeHtml(conflict.localContent.substring(0, 500))}${conflict.localContent.length > 500 ? '...' : ''}</pre>
+			`;
+			
+			const cloudPreview = previewEl.createEl('div');
+			cloudPreview.innerHTML = `
+				<h4>Cloud Content Preview:</h4>
+				<pre style="background: var(--background-secondary); padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto;">${this.escapeHtml(conflict.cloudContent.substring(0, 500))}${conflict.cloudContent.length > 500 ? '...' : ''}</pre>
+			`;
+		}
+	}
+
+	private escapeHtml(text: string): string {
+		const div = document.createElement('div');
+		div.textContent = text;
+		return div.innerHTML;
+	}
+
+	private resolveConflict(choice: 'local' | 'cloud') {
+		const conflict = this.conflicts[this.currentIndex];
+		this.resolutions.push({
+			filePath: conflict.filePath,
+			choice: choice
+		});
+		
+		this.currentIndex++;
+		this.displayConflict();
 	}
 }

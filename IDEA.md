@@ -99,21 +99,21 @@ This makes the plugin robust and implements your desired user-controlled conflic
     -   [x] **Reconnection Logic:** Auto-check sync status when WebSocket reconnects
     -   [x] **Progress Tracking:** Real-time progress display during bulk operations
     -   [x] **File Deletion Handling:** Local deletes propagate to cloud with soft delete + TTL
-    -   [ ] **Conflict UI:** If a conflict is detected (`local changes exist` AND `server version is newer`), use the Obsidian Modal API to display the choice dialog.
-    -   [ ] **Implement User Choices:**
+    -   [x] **Conflict UI:** If a conflict is detected (`local changes exist` AND `server version is newer`), use the Obsidian Modal API to display the choice dialog.
+    -   [x] **Implement User Choices:**
         -   "Keep Local": Trigger the file upload function from Milestone 3.
         -   "Use Cloud": Trigger the file download function from Milestone 3.
-    -   [ ] Once all conflicts are resolved and the offline queue is cleared, resume normal real-time operation.
+    -   [x] Once all conflicts are resolved and the offline queue is cleared, resume normal real-time operation.
 
 ---
 
 ### Milestone 6: Polishing
 
--   [ ] **Error Handling:** Add robust error handling for network failures, failed patches, etc.
+-   [x] **Error Handling:** Add robust error handling for network failures, failed patches, etc.
 -   [x] **Status Indicator:** Add a small status icon in the Obsidian status bar to show sync status (e.g., "Connected," "Syncing," "Offline," "Conflict").
 -   [x] **Security Review:** Ensure your Lambda functions have the minimum necessary IAM permissions (e.g., only access to their specific S3 paths and DynamoDB tables).
--   [ ] **Documentation:** Write a clear `README.md` explaining how to deploy the backend and install/configure the plugin.
--   [ ] only save the file after the user has stopped typing for a while (as not to save too often) (and add the constant updating we have now as an option in the settings to toggle instead)
+-   [x] **Documentation:** Write a clear `README.md` explaining how to deploy the backend and install/configure the plugin.
+-   [x] only save the file after the user has stopped typing for a while (as not to save too often) (and add the constant updating we have now as an option in the settings to toggle instead)
 
 ### Milestone 7: Auth
 
@@ -129,4 +129,4 @@ This makes the plugin robust and implements your desired user-controlled conflic
 
 -   [ ] remove unnecessary parts of ui (settings menu)
 -   [ ] remove extra commands
--   [ ] add more control in the settings ui with sync rates, debounce options and other things that power users might appreciate
+-   [x] add more control in the settings ui with sync rates, debounce options and other things that power users might appreciate

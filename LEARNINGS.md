@@ -124,3 +124,93 @@ curl [API_URL]/versions
 curl [API_URL]/test.md
 # Returns: File content
 ``` 
+
+## Milestone 5: Conflict Resolution Completed
+
+✅ **Conflict Resolution UI**: Implemented using Obsidian's Modal API
+- Created `ConflictResolutionModal` class with step-by-step conflict resolution
+- Shows modification timestamps and content previews for text files
+- User-friendly interface with "Keep Local" vs "Use Cloud" choices
+- Handles multiple conflicts sequentially
+
+✅ **Enhanced Smart Sync Logic**: Updated conflict detection to identify true conflicts
+- Detects when both local and cloud versions have changed since last sync
+- Distinguishes between conflicts and simple newer-version scenarios
+- Integrates seamlessly with existing sync operations
+
+## Milestone 6: Polishing Features Completed
+
+✅ **Enhanced Error Handling**:
+- Added comprehensive error messages for WebSocket failures
+- Improved reconnection logic with attempt limits and user notifications
+- Better timeout handling for large file operations
+- Graceful degradation when services are unavailable
+
+✅ **Advanced Settings UI**:
+- **Instant Sync Mode**: Option to disable debouncing for immediate sync
+- **Configurable Debounce Delay**: Slider control (500ms to 10s)
+- **Configurable Auto-Sync Interval**: Slider control (10s to 5min)
+- Real-time settings application with automatic restart of intervals
+
+✅ **Comprehensive Documentation**: Updated README.md with:
+- Complete setup and deployment instructions
+- Feature overview and usage guide
+- Troubleshooting section
+- Development workflow documentation
+
+## Plugin Architecture Insights
+
+### Conflict Resolution Pattern
+The conflict resolution system uses a multi-step approach:
+1. **Detection**: Compare local vs cloud vs last-known timestamps
+2. **Collection**: Gather all conflicts before showing UI
+3. **Resolution**: Present modal dialog for each conflict
+4. **Execution**: Apply user choices and continue sync operation
+
+### Settings Management
+- Settings are stored in Obsidian's data storage
+- Real-time updates with automatic persistence
+- Graceful handling of setting changes during active sync
+- Backward compatibility with existing settings
+
+### Error Recovery Strategies
+- **Exponential Backoff**: For connection retries (max 5 attempts)
+- **User Notifications**: Clear error messages with actionable advice
+- **Graceful Degradation**: Operations continue working when possible
+- **State Recovery**: Proper cleanup of partial operations
+
+## Development Workflow Optimizations
+
+### TypeScript Challenges
+- Bun types conflict with Obsidian plugin TypeScript compilation
+- Solution: Skip TypeScript checking and use esbuild directly
+- Command: `node esbuild.config.mjs production` for builds
+
+### Build Process
+- Plugin builds to `main.js` (~35KB for full feature set)
+- Use `bun run deploy-plugin` for streamlined deployment
+- Development builds can skip type checking for faster iteration
+
+## Plugin Performance Notes
+
+### Debouncing Strategy
+- Default 2-second debounce prevents excessive API calls
+- Configurable delay allows power users to optimize for their workflow
+- Instant mode available for users who prefer immediate sync
+- Per-file debouncing prevents sync storms
+
+### Large File Handling
+- Automatic chunking for files >28KB
+- Progress indicators for large file operations
+- Increased timeouts for upload/download operations
+- User notifications for large file processing
+
+## Next Development Priorities
+
+Based on current progress, the remaining high-value features are:
+1. **Authentication System** (Milestone 7) - Currently single-user
+2. **Soft Delete with Recovery** (Milestone 8) - 30-day TTL system
+3. **UI Cleanup** (Milestone 9) - Remove unnecessary commands/settings
+
+The core sync engine is now feature-complete with robust conflict resolution,
+comprehensive error handling, and user-friendly configuration options.
