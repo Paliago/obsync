@@ -31,7 +31,23 @@ export default $config({
         GSI1: { hashKey: "gsi1pk", rangeKey: "gsi1sk" },
         GSI2: { hashKey: "gsi2pk", rangeKey: "gsi2sk" },
       },
+      stream: "new-and-old-images",
       ttl: "expireAt",
+    });
+
+    // TODO:
+    table.subscribe("MySubscriber", "packages/backend/src/subscriber.handler", {
+      filters: [
+        {
+          dynamodb: {
+            Keys: {
+              CustomerName: {
+                S: ["AnyCompany Industries"]
+              }
+            }
+          }
+        }
+      ]
     });
 
     // WebSocket API for real-time sync

@@ -9,6 +9,18 @@ const dynamoClient = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(dynamoClient);
 const s3Client = new S3Client({});
 
+// In-memory chunk storage (for Lambda lifecycle)
+// In production, you might want to use DynamoDB for chunk storage
+const chunkBuffers = new Map<string, {
+  chunks: Map<number, string>;
+  totalChunks: number;
+  filePath: string;
+  fileType: string;
+  lastModified?: number;
+  connectionId: string;
+  action: string;
+}>();
+
 export const handler: APIGatewayProxyHandler = async (event) => {
   const connectionId = event.requestContext.connectionId!;
   const domainName = event.requestContext.domainName!;
@@ -21,6 +33,11 @@ export const handler: APIGatewayProxyHandler = async (event) => {
   try {
     const message = JSON.parse(event.body || "{}");
     console.log(`WebSocket message from ${connectionId}:`, message);
+
+    // Handle chunked messages
+    if (message.isChunked && message.chunkId && message.chunkIndex !== undefined && message.totalChunks) {
+      return await handleChunkedMessage(message, connectionId, apiGatewayClient);
+    }
 
     switch (message.action) {
       case "upload":
@@ -52,14 +69,96 @@ export const handler: APIGatewayProxyHandler = async (event) => {
   }
 };
 
+async function handleChunkedMessage(
+  message: any,
+  connectionId: string,
+  apiGatewayClient: ApiGatewayManagementApiClient
+) {
+  const { chunkId, chunkIndex, totalChunks, filePath, content, action, fileType, lastModified } = message;
+  
+  if (!chunkId || chunkIndex === undefined || !totalChunks || !filePath || !action) {
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "error",
+      message: "Invalid chunked message",
+    });
+    return { statusCode: 400, body: "Invalid chunked message" };
+  }
+
+  // Initialize chunk buffer if needed
+  if (!chunkBuffers.has(chunkId)) {
+    chunkBuffers.set(chunkId, {
+      chunks: new Map(),
+      totalChunks,
+      filePath,
+      fileType: fileType || 'text',
+      lastModified,
+      connectionId,
+      action
+    });
+  }
+
+  const buffer = chunkBuffers.get(chunkId)!;
+  
+  // Store chunk
+  buffer.chunks.set(chunkIndex, content || '');
+  
+  console.log(`Received chunk ${chunkIndex + 1}/${totalChunks} for ${filePath} (${Math.round(new Blob([content || '']).size / 1024)}KB)`);
+
+  // Check if all chunks received
+  if (buffer.chunks.size === buffer.totalChunks) {
+    // Reassemble content
+    let fullContent = '';
+    for (let i = 0; i < buffer.totalChunks; i++) {
+      const chunk = buffer.chunks.get(i);
+      if (chunk === undefined) {
+        console.error(`Missing chunk ${i} for ${filePath}`);
+        chunkBuffers.delete(chunkId);
+        await sendToConnection(apiGatewayClient, connectionId, {
+          type: "error",
+          message: `Missing chunk ${i} for ${filePath}`,
+        });
+        return { statusCode: 400, body: "Missing chunk" };
+      }
+      fullContent += chunk;
+    }
+
+    console.log(`Successfully reassembled ${filePath} from ${buffer.totalChunks} chunks (${Math.round(new Blob([fullContent]).size / 1024)}KB)`);
+
+    // Clean up buffer
+    chunkBuffers.delete(chunkId);
+
+    // Create complete message and process it
+    const completeMessage = {
+      action: buffer.action,
+      filePath: buffer.filePath,
+      content: fullContent,
+      fileType: buffer.fileType,
+      lastModified: buffer.lastModified
+    };
+
+    // Process the complete message
+    switch (buffer.action) {
+      case "upload":
+        return await handleFileUpload(completeMessage, connectionId, apiGatewayClient, true);
+      default:
+        console.log(`Unsupported chunked action: ${buffer.action}`);
+        return { statusCode: 400, body: "Unsupported chunked action" };
+    }
+  }
+
+  // Not all chunks received yet
+  return { statusCode: 200, body: "Chunk received" };
+}
+
 async function handleFileUpload(
   message: any, 
   connectionId: string, 
-  apiGatewayClient: ApiGatewayManagementApiClient
+  apiGatewayClient: ApiGatewayManagementApiClient,
+  isReassembledChunk: boolean = false
 ) {
-  const { filePath, content, version } = message;
+  const { filePath, content, version, lastModified, fileType } = message;
   
-  if (!filePath || !content) {
+  if (!filePath || content === undefined) {
     await sendToConnection(apiGatewayClient, connectionId, {
       type: "error",
       message: "Missing filePath or content",
@@ -69,17 +168,33 @@ async function handleFileUpload(
 
   const key = `files/${filePath}`;
   const newVersion = version || Date.now().toString();
+  const uploadedAt = Date.now();
+  const clientLastModified = lastModified || uploadedAt;
+  const detectedFileType = fileType || 'text';
 
   try {
+    // For binary files, we need to handle the content differently
+    let bodyContent: string | Buffer = content;
+    let contentType = 'text/plain';
+
+    if (detectedFileType === 'binary') {
+      // Content is base64 encoded, decode it for S3 storage
+      bodyContent = Buffer.from(content, 'base64');
+      contentType = 'application/octet-stream';
+    }
+
     // Upload to S3
     await s3Client.send(
       new PutObjectCommand({
         Bucket: Resource.Storage.name,
         Key: key,
-        Body: content,
+        Body: bodyContent,
+        ContentType: contentType,
         Metadata: {
           version: newVersion,
           uploadedBy: connectionId,
+          fileType: detectedFileType,
+          clientLastModified: clientLastModified.toString(),
         },
       })
     );
@@ -93,17 +208,21 @@ async function handleFileUpload(
           sk: `VERSION#${newVersion}`,
           filePath,
           version: newVersion,
-          lastModified: Date.now(),
+          lastModified: uploadedAt,
+          clientLastModified: clientLastModified,
           uploadedBy: connectionId,
+          fileType: detectedFileType,
         },
       })
     );
 
-    // Notify the uploader
+    // Notify the uploader - return the client's original lastModified time
     await sendToConnection(apiGatewayClient, connectionId, {
       type: "upload_success",
       filePath,
       version: newVersion,
+      lastModified: clientLastModified,
+      fileType: detectedFileType,
     });
 
     // Broadcast file change to other connected clients
@@ -112,9 +231,13 @@ async function handleFileUpload(
       filePath,
       version: newVersion,
       action: "upload",
+      fileType: detectedFileType,
     });
 
-    console.log(`File uploaded: ${filePath} version ${newVersion}`);
+    const logMessage = isReassembledChunk 
+      ? `Large file uploaded from chunks: ${filePath} version ${newVersion} (type: ${detectedFileType})`
+      : `File uploaded: ${filePath} version ${newVersion} (type: ${detectedFileType})`;
+    console.log(logMessage);
     return { statusCode: 200, body: "File uploaded successfully" };
   } catch (error) {
     console.error("Upload error:", error);
@@ -152,8 +275,24 @@ async function handleFileDownload(
       })
     );
 
-    const content = await s3Response.Body?.transformToString();
     const version = s3Response.Metadata?.version || "unknown";
+    const fileType = s3Response.Metadata?.fileType || "text";
+    const clientLastModified = s3Response.Metadata?.clientLastModified;
+
+    let content: string;
+    
+    if (fileType === 'binary') {
+      // For binary files, convert to base64
+      const bodyBytes = await s3Response.Body?.transformToByteArray();
+      if (bodyBytes) {
+        content = Buffer.from(bodyBytes).toString('base64');
+      } else {
+        throw new Error('Failed to read binary file content');
+      }
+    } else {
+      // For text files, get as string
+      content = await s3Response.Body?.transformToString() || '';
+    }
 
     // Send file content back through WebSocket
     await sendToConnection(apiGatewayClient, connectionId, {
@@ -161,9 +300,11 @@ async function handleFileDownload(
       filePath,
       content,
       version,
+      fileType,
+      lastModified: clientLastModified ? parseInt(clientLastModified) : undefined,
     });
 
-    console.log(`File downloaded: ${filePath} version ${version}`);
+    console.log(`File downloaded: ${filePath} version ${version} (type: ${fileType})`);
     return { statusCode: 200, body: "File downloaded successfully" };
   } catch (error) {
     console.error("Download error:", error);
@@ -292,10 +433,15 @@ async function handleFileList(
       })
     );
 
-    const files: Record<string, string> = {};
+    const files: Record<string, any> = {};
     response.Items?.forEach((item) => {
       if (item.filePath && item.version && !item.deleted) {
-        files[item.filePath] = item.version;
+        files[item.filePath] = {
+          version: item.version,
+          lastModified: item.lastModified || 0,
+          clientLastModified: item.clientLastModified || item.lastModified || 0,
+          fileType: item.fileType || 'text',
+        };
       }
     });
 

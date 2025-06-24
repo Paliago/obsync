@@ -21,7 +21,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
           sk: `CONNECTION#${connectionId}`,
           connectionId,
           connectedAt: timestamp,
-          ttl: Math.floor(timestamp / 1000) + 86400, // 24 hours
+          expireAt: Math.floor(timestamp / 1000) + 86400, // 24 hours
         },
       })
     );

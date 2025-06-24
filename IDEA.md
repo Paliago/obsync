@@ -107,13 +107,26 @@ This makes the plugin robust and implements your desired user-controlled conflic
 
 ---
 
-### Milestone 6: Polishing and Finalizing
+### Milestone 6: Polishing
 
 -   [ ] **Error Handling:** Add robust error handling for network failures, failed patches, etc.
--   [ ] **Status Indicator:** Add a small status icon in the Obsidian status bar to show sync status (e.g., "Connected," "Syncing," "Offline," "Conflict").
--   [ ] **Security Review:** Ensure your Lambda functions have the minimum necessary IAM permissions (e.g., only access to their specific S3 paths and DynamoDB tables).
+-   [x] **Status Indicator:** Add a small status icon in the Obsidian status bar to show sync status (e.g., "Connected," "Syncing," "Offline," "Conflict").
+-   [x] **Security Review:** Ensure your Lambda functions have the minimum necessary IAM permissions (e.g., only access to their specific S3 paths and DynamoDB tables).
 -   [ ] **Documentation:** Write a clear `README.md` explaining how to deploy the backend and install/configure the plugin.
+-   [ ] only save the file after the user has stopped typing for a while (as not to save too often) (and add the constant updating we have now as an option in the settings to toggle instead)
 
+### Milestone 7: Auth
 
-- [ ] add ttl on ddb object which triggers a stream which removes the file from s3 finally
-- [ ] auth the whole way so noone else can see your files
+-   [ ] auth the whole way so noone else can see your files
+
+### Milestone 8: Soft Deletes
+
+-   [ ] only soft delete files by adding an expireAt to the ddb item
+-   [ ] add a view to see deleted files (and undo by removing the expireAt key)
+-   [ ] add a ddb stream which removes the file from s3 when the ddb item expires (hard delete)
+
+### Milestone 9: Clean up plugin ui
+
+-   [ ] remove unnecessary parts of ui (settings menu)
+-   [ ] remove extra commands
+-   [ ] add more control in the settings ui with sync rates, debounce options and other things that power users might appreciate
