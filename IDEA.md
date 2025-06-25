@@ -18,8 +18,6 @@ The goal here is to create the project structure and deploy the absolute bare mi
 -   [x] **Plugin Setup**
     -   [x] Add the obsidian sample plugin to `obsidian-sample-plugin`
 
----
-
 ### Milestone 2: Backend - Core File Operations & Auth
 
 This milestone focuses on building the stateless, request/response part of the backend using a Lambda Function URL. At the end of this, you'll be able to upload and download files using a tool like Postman.
@@ -31,15 +29,13 @@ This milestone focuses on building the stateless, request/response part of the b
     -   [x] Create an .md file to test with
     -   [x] Use curl to test the functionality thus far
 
----
-
 ### Milestone 3: Plugin - Manual Sync & Settings
 
 Now, let's make the plugin talk to the backend. We'll skip automatic sync for now and focus on user-triggered actions.
 
 -   [x] **Plugin UI**
     -   [x] Create a "Settings" tab for your plugin in Obsidian.
-    -   [x] Add fields for the user to enter their username, password, and the Lambda Function URL.
+    -   [x] Add fields for the user to enter their API key and the Lambda Function URL.
 -   [x] **Manual Sync Commands**
     -   [x] Add two commands to the Obsidian command palette:
         -   `Sync: Upload active file to cloud`
@@ -49,8 +45,6 @@ Now, let's make the plugin talk to the backend. We'll skip automatic sync for no
     -   [x] Built the plugin successfully (generates `main.js`)
     -   [x] Backend API supports file upload, download, and listing
     -   [x] Verified complete upload → list → download workflow via API testing
-
----
 
 ### Milestone 4: Real-time Sync Engine (WebSockets)
 
@@ -86,8 +80,6 @@ This milestone implements WebSocket-based real-time sync to replace HTTP-based m
     -   [x] Confirm CORS issues are resolved
     -   [x] Update deployment script for new infrastructure
 
----
-
 ### Milestone 5: Offline Mode & Conflict Resolution
 
 This makes the plugin robust and implements your desired user-controlled conflict resolution.
@@ -105,8 +97,6 @@ This makes the plugin robust and implements your desired user-controlled conflic
         -   "Use Cloud": Trigger the file download function from Milestone 3.
     -   [x] Once all conflicts are resolved and the offline queue is cleared, resume normal real-time operation.
 
----
-
 ### Milestone 6: Polishing
 
 -   [x] **Error Handling:** Add robust error handling for network failures, failed patches, etc.
@@ -117,13 +107,13 @@ This makes the plugin robust and implements your desired user-controlled conflic
 
 ### Milestone 7: Auth
 
--   [ ] auth the whole way so noone else can see your files
+-   [x] auth the whole way so noone else can see your files
 
 ### Milestone 8: Soft Deletes
 
--   [ ] only soft delete files by adding an expireAt to the ddb item
--   [ ] add a view to see deleted files (and undo by removing the expireAt key)
--   [ ] add a ddb stream which removes the file from s3 when the ddb item expires (hard delete)
+-   [x] only soft delete files by adding an expireAt to the ddb item
+-   [x] add a view to see deleted files (and undo by removing the expireAt key)
+-   [x] add a ddb stream which removes the file from s3 when the ddb item expires (hard delete)
 
 ### Milestone 9: Clean up plugin ui
 

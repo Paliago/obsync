@@ -9,8 +9,6 @@ import {
 } from "obsidian";
 
 interface SyncSettings {
-  username: string;
-  password: string;
   apiKey: string;
   apiUrl: string;
   websocketUrl: string;
@@ -38,8 +36,6 @@ interface SyncSettings {
 }
 
 const DEFAULT_SETTINGS: SyncSettings = {
-  username: "",
-  password: "",
   apiKey: "",
   apiUrl: "",
   websocketUrl: "",
@@ -149,6 +145,14 @@ export default class ObsidianSyncPlugin extends Plugin {
     return this.settings.chunkSizeKB * 1000; // Convert KB to bytes, leaving room for JSON overhead
   }
 
+  // Download promise tracking
+  private pendingDownloads: Map<string, (success: boolean) => void> = new Map();
+
+  // Settings deleted files callback
+  private pendingSettingsDeletedFilesCallback:
+    | ((files: Record<string, any>) => void)
+    | null = null;
+
   // Debounced settings save
   private saveSettingsTimeout: NodeJS.Timeout | null = null;
 
@@ -254,6 +258,14 @@ export default class ObsidianSyncPlugin extends Plugin {
           this.stopAutoSync();
           new Notice("Auto-sync disabled");
         }
+      },
+    });
+
+    this.addCommand({
+      id: "view-deleted-files",
+      name: "View deleted files",
+      callback: () => {
+        this.viewDeletedFiles();
       },
     });
 
@@ -691,9 +703,13 @@ export default class ObsidianSyncPlugin extends Plugin {
       case "upload_success":
         console.log(`File uploaded: ${data.filePath}`);
         // Update local tracking to prevent re-upload
-        if (data.filePath && data.lastModified) {
-          this.lastModifiedTimes.set(data.filePath, data.lastModified);
-          this.debouncedSaveSettings(); // Persist the tracking
+        // Use the local file's timestamp as the sync reference point
+        if (data.filePath) {
+          const file = this.app.vault.getAbstractFileByPath(data.filePath);
+          if (file instanceof TFile) {
+            this.lastModifiedTimes.set(data.filePath, file.stat.mtime);
+            this.debouncedSaveSettings(); // Persist the tracking
+          }
         }
         break;
 
@@ -705,6 +721,12 @@ export default class ObsidianSyncPlugin extends Plugin {
             data.fileType || "text",
             data.lastModified,
           );
+          // Resolve pending download promise
+          if (this.pendingDownloads.has(data.filePath)) {
+            const resolve = this.pendingDownloads.get(data.filePath);
+            this.pendingDownloads.delete(data.filePath);
+            resolve?.(true);
+          }
         }
         break;
 
@@ -715,10 +737,40 @@ export default class ObsidianSyncPlugin extends Plugin {
         break;
 
       case "file_changed":
-        if (data.filePath && data.action === "upload") {
-          new Notice(`File updated by another client: ${data.filePath}`);
-          // Optionally auto-download the updated file
-          // this.downloadFile(data.filePath);
+        if (data.filePath) {
+          if (data.action === "upload") {
+            new Notice(`File updated by another client: ${data.filePath}`);
+            // Auto-download the updated file to keep devices in sync
+            this.downloadFile(data.filePath);
+          } else if (data.action === "delete") {
+            new Notice(`File deleted by another client: ${data.filePath}`);
+            // Delete the file locally to keep devices in sync
+            const file = this.app.vault.getAbstractFileByPath(data.filePath);
+            if (file instanceof TFile) {
+              console.log(
+                `Deleting file locally due to remote deletion: ${data.filePath}`,
+              );
+              this.fileWatchingEnabled = false; // Temporarily disable to prevent loop
+              this.app.vault
+                .delete(file)
+                .then(() => {
+                  // Remove from tracking
+                  this.lastModifiedTimes.delete(data.filePath!);
+                  this.debouncedSaveSettings();
+                  // Re-enable file watching after a short delay
+                  setTimeout(() => {
+                    this.fileWatchingEnabled = true;
+                  }, 1000);
+                })
+                .catch((error) => {
+                  console.error(
+                    `Failed to delete file locally: ${data.filePath}`,
+                    error,
+                  );
+                  this.fileWatchingEnabled = true;
+                });
+            }
+          }
         }
         break;
 
@@ -729,9 +781,30 @@ export default class ObsidianSyncPlugin extends Plugin {
         }
         break;
 
+      case "deleted_files_list":
+        if (data.files) {
+          this.handleDeletedFilesListResponse(data.files);
+        }
+        break;
+
+      case "restore_success":
+        if (data.filePath) {
+          new Notice(`File restored: ${data.filePath}`);
+          console.log(`File restored successfully: ${data.filePath}`);
+          // Refresh the file list to show the restored file
+          this.listCloudFiles();
+        }
+        break;
+
       case "error":
         new Notice(`Sync error: ${data.message}`);
         console.error("WebSocket error:", data.message);
+        // If this is a download error, resolve any pending download promises
+        if (data.filePath && this.pendingDownloads.has(data.filePath)) {
+          const resolve = this.pendingDownloads.get(data.filePath);
+          this.pendingDownloads.delete(data.filePath);
+          resolve?.(false);
+        }
         break;
 
       default:
@@ -867,6 +940,19 @@ export default class ObsidianSyncPlugin extends Plugin {
         console.log(`Uploading file: ${filePath} (type: ${fileType})`);
       }
 
+      // Send the upload message
+      const success = this.sendWebSocketMessage({
+        action: "upload",
+        filePath: filePath,
+        content: fileContent,
+        fileType: fileType,
+        lastModified: file.stat.mtime,
+      });
+
+      if (!success) {
+        throw new Error("Failed to send upload message");
+      }
+
       // Note: lastModifiedTimes will be updated when we receive upload_success response
     } catch (error) {
       console.error(`Error uploading file ${filePath}:`, error);
@@ -884,40 +970,56 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.downloadFile(activeFile.path);
   }
 
-  downloadFile(filePath: string) {
+  downloadFile(filePath: string): Promise<boolean> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       new Notice("Not connected to real-time sync");
-      return false;
+      return Promise.resolve(false);
     }
 
-    try {
-      this.updateStatusBar("Downloading...", "syncing");
+    return new Promise((resolve) => {
+      try {
+        this.updateStatusBar("Downloading...", "syncing");
 
-      const success = this.sendWebSocketMessage({
-        action: "download",
-        filePath: filePath,
-      });
-
-      if (success) {
-        console.log(`Downloading file: ${filePath}`);
-      } else {
-        new Notice(`Failed to request download for: ${filePath}`);
-        return false;
-      }
-
-      // Set timeout to detect if download fails
-      setTimeout(() => {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.updateStatusBar("Connected", "connected");
+        // Store the resolve function to call when download completes
+        if (!this.pendingDownloads) {
+          this.pendingDownloads = new Map();
         }
-      }, this.settings.operationTimeoutMs);
+        this.pendingDownloads.set(filePath, resolve);
 
-      return true;
-    } catch (error) {
-      console.error(`Error downloading file ${filePath}:`, error);
-      new Notice(`Failed to download ${filePath}: ${(error as any).message}`);
-      return false;
-    }
+        const success = this.sendWebSocketMessage({
+          action: "download",
+          filePath: filePath,
+        });
+
+        if (success) {
+          console.log(`Downloading file: ${filePath}`);
+        } else {
+          new Notice(`Failed to request download for: ${filePath}`);
+          this.pendingDownloads.delete(filePath);
+          resolve(false);
+          return;
+        }
+
+        // Set timeout to detect if download fails
+        setTimeout(() => {
+          if (this.pendingDownloads?.has(filePath)) {
+            console.error(`Download timeout for ${filePath}`);
+            this.pendingDownloads.delete(filePath);
+            resolve(false);
+          }
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.updateStatusBar("Connected", "connected");
+          }
+        }, this.settings.operationTimeoutMs);
+      } catch (error) {
+        console.error(`Error downloading file ${filePath}:`, error);
+        new Notice(`Failed to download ${filePath}: ${(error as any).message}`);
+        if (this.pendingDownloads?.has(filePath)) {
+          this.pendingDownloads.delete(filePath);
+        }
+        resolve(false);
+      }
+    });
   }
 
   private async applyFileContent(
@@ -946,8 +1048,11 @@ export default class ObsidianSyncPlugin extends Plugin {
           );
           await this.app.vault.modifyBinary(file, binaryData.buffer);
         }
-        // Update last modified time to prevent sync loop
-        this.lastModifiedTimes.set(filePath, lastModified || file.stat.mtime);
+        // Update last known sync time to the cloud's timestamp to prevent sync loop
+        // This tracks when we last synced, not the local file's timestamp
+        if (lastModified) {
+          this.lastModifiedTimes.set(filePath, lastModified);
+        }
         this.debouncedSaveSettings(); // Persist the tracking
       } else {
         // Create new file
@@ -963,11 +1068,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 
         // Get the created file to update tracking
         const newFile = this.app.vault.getAbstractFileByPath(filePath);
-        if (newFile instanceof TFile) {
-          this.lastModifiedTimes.set(
-            filePath,
-            lastModified || newFile.stat.mtime,
-          );
+        if (newFile instanceof TFile && lastModified) {
+          // Track the cloud's timestamp as our last sync time
+          this.lastModifiedTimes.set(filePath, lastModified);
           this.debouncedSaveSettings(); // Persist the tracking
         }
       }
@@ -1067,6 +1170,30 @@ export default class ObsidianSyncPlugin extends Plugin {
     }
   }
 
+  private handleDeletedFilesListResponse(files: Record<string, any>) {
+    console.log("Received deleted files list:", files);
+
+    // Check if this is for settings display
+    if (this.pendingSettingsDeletedFilesCallback) {
+      this.pendingSettingsDeletedFilesCallback(files);
+      this.pendingSettingsDeletedFilesCallback = null;
+      return;
+    }
+
+    const deletedFilesList = Object.keys(files);
+
+    if (deletedFilesList.length === 0) {
+      new Notice("No deleted files found");
+      return;
+    }
+
+    // Create a modal to show deleted files with restore options
+    const modal = new DeletedFilesModal(this.app, files, (filePath: string) => {
+      this.restoreFile(filePath);
+    });
+    modal.open();
+  }
+
   private displayFileList(files: Record<string, any>) {
     const fileList = Object.keys(files);
 
@@ -1120,12 +1247,12 @@ export default class ObsidianSyncPlugin extends Plugin {
               cloudFileInfo.lastModified ||
               0;
 
-        // Check if file has been modified since last sync or is newer than cloud version
+        // Check if file has been modified since last sync
         const lastKnownTime = this.lastModifiedTimes.get(file.path);
-        const fileNeedsSync = !lastKnownTime || file.stat.mtime > lastKnownTime;
-        const localIsNewer = file.stat.mtime > cloudLastModified;
+        const localModified = file.stat.mtime > (lastKnownTime || 0);
+        const cloudModified = cloudLastModified > (lastKnownTime || 0);
 
-        if (fileNeedsSync || localIsNewer) {
+        if (localModified || cloudModified) {
           outOfSyncFiles.push(file.path);
           console.log(`📝 OUT OF SYNC: ${file.path}`);
           console.log(`  - File modified: ${new Date(file.stat.mtime)}`);
@@ -1135,7 +1262,9 @@ export default class ObsidianSyncPlugin extends Plugin {
           console.log(
             `  - Cloud version: ${cloudVersion}, modified: ${new Date(cloudLastModified)}`,
           );
-          console.log(`  - Local is newer: ${localIsNewer}`);
+          console.log(
+            `  - Local modified: ${localModified}, Cloud modified: ${cloudModified}`,
+          );
         } else {
           console.log(`✅ IN SYNC: ${file.path}`);
         }
@@ -1444,7 +1573,15 @@ export default class ObsidianSyncPlugin extends Plugin {
     }
   }
 
-  private async processSmartSync(cloudFiles: Record<string, any>) {
+  private async processSmartSync(
+    cloudFiles: Record<string, any>,
+    options: {
+      isBackground?: boolean;
+      maxFiles?: number;
+      showConflicts?: boolean;
+      rateLimitMs?: number;
+    } = {},
+  ) {
     const localFiles = this.getAllLocalFiles().filter((file) =>
       this.shouldSyncFile(file),
     );
@@ -1472,35 +1609,91 @@ export default class ObsidianSyncPlugin extends Plugin {
         const lastKnownTime = this.lastModifiedTimes.get(file.path);
 
         // Detect true conflicts: both local and cloud have been modified since last sync
-        const localModified = file.stat.mtime > (lastKnownTime || 0);
-        const cloudModified = cloudLastModified > (lastKnownTime || 0);
+        // If we don't have a lastKnownTime, this is the first sync - not a conflict
+        if (!lastKnownTime) {
+          // First time seeing this file - determine which version to use based on timestamps
+          const timeDiff = Math.abs(file.stat.mtime - cloudLastModified);
+          const significantDifference = timeDiff > 1000; // 1 second threshold
 
-        if (
-          localModified &&
-          cloudModified &&
-          file.stat.mtime !== cloudLastModified
-        ) {
-          // True conflict: both sides have changes
-          conflicts.push({
-            filePath: file.path,
-            localModified: file.stat.mtime,
-            cloudModified: cloudLastModified,
-          });
-          console.log(
-            `⚠️ CONFLICT: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
-          );
-        } else if (localModified || file.stat.mtime > cloudLastModified) {
-          // Local is newer or only local has changes, upload it
-          filesToUpload.push(file);
-          console.log(
-            `📤 WILL UPLOAD: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
-          );
-        } else if (cloudModified || cloudLastModified > file.stat.mtime) {
-          // Cloud is newer or only cloud has changes, download it
-          filesToDownload.push(file.path);
-          console.log(
-            `📥 WILL DOWNLOAD: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
-          );
+          if (significantDifference && file.stat.mtime > cloudLastModified) {
+            filesToUpload.push(file);
+            console.log(
+              `📤 WILL UPLOAD: ${file.path} (first sync, local newer - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
+            );
+          } else if (
+            significantDifference &&
+            cloudLastModified > file.stat.mtime
+          ) {
+            filesToDownload.push(file.path);
+            console.log(
+              `📥 WILL DOWNLOAD: ${file.path} (first sync, cloud newer - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
+            );
+          } else {
+            // Files are essentially the same, just track them
+            console.log(
+              `✅ IN SYNC: ${file.path} (first sync, timestamps similar - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)}, diff: ${timeDiff}ms)`,
+            );
+          }
+        } else {
+          // We have tracking info, check for real conflicts
+          const localModified = file.stat.mtime > lastKnownTime;
+          const cloudModified = cloudLastModified > lastKnownTime;
+
+          if (
+            localModified &&
+            cloudModified &&
+            file.stat.mtime !== cloudLastModified
+          ) {
+            // True conflict: both sides have changes
+            conflicts.push({
+              filePath: file.path,
+              localModified: file.stat.mtime,
+              cloudModified: cloudLastModified,
+            });
+            console.log(
+              `⚠️ CONFLICT: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
+            );
+          } else if (localModified && !cloudModified) {
+            // Only local has changes since last sync, upload it
+            filesToUpload.push(file);
+            console.log(
+              `📤 WILL UPLOAD: ${file.path} (only local modified - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)}, last sync: ${new Date(lastKnownTime)})`,
+            );
+          } else if (cloudModified && !localModified) {
+            // Only cloud has changes since last sync, download it
+            filesToDownload.push(file.path);
+            console.log(
+              `📥 WILL DOWNLOAD: ${file.path} (only cloud modified - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)}, last sync: ${new Date(lastKnownTime)})`,
+            );
+          } else if (!localModified && !cloudModified) {
+            // Neither has changed since last sync - files should be in sync
+            // Only check for significant timestamp differences (more than 1 second) to avoid
+            // unnecessary syncing due to minor timestamp variations
+            const timeDiff = Math.abs(file.stat.mtime - cloudLastModified);
+            const significantDifference = timeDiff > 1000; // 1 second threshold
+
+            if (significantDifference && file.stat.mtime > cloudLastModified) {
+              // Local is significantly newer but wasn't marked as modified
+              filesToUpload.push(file);
+              console.log(
+                `📤 WILL UPLOAD: ${file.path} (local significantly newer - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)}, diff: ${timeDiff}ms)`,
+              );
+            } else if (
+              significantDifference &&
+              cloudLastModified > file.stat.mtime
+            ) {
+              // Cloud is significantly newer but wasn't marked as modified
+              filesToDownload.push(file.path);
+              console.log(
+                `📥 WILL DOWNLOAD: ${file.path} (cloud significantly newer - local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)}, diff: ${timeDiff}ms)`,
+              );
+            } else {
+              // Files are in sync (or difference is negligible)
+              console.log(
+                `✅ IN SYNC: ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)}, diff: ${timeDiff}ms)`,
+              );
+            }
+          }
         }
       }
     });
@@ -1516,124 +1709,226 @@ export default class ObsidianSyncPlugin extends Plugin {
 
     // Handle conflicts first if any exist
     if (conflicts.length > 0) {
-      console.log(
-        `Found ${conflicts.length} conflicts, showing resolution dialog...`,
-      );
+      console.log(`Found ${conflicts.length} conflicts...`);
 
-      // Load content for text file conflicts to show preview
-      for (const conflict of conflicts) {
-        const localFile = localFiles.find((f) => f.path === conflict.filePath);
-        if (localFile && this.getFileType(localFile) === "text") {
-          try {
-            conflict.localContent = await this.app.vault.read(localFile);
-            // Get cloud content - we'll need to fetch it
-            // For now, we'll resolve conflicts without content preview
-            // This could be enhanced later by fetching cloud content
-          } catch (error) {
-            console.error(
-              `Failed to read local file ${conflict.filePath}:`,
-              error,
-            );
-          }
-        }
-      }
+      // For background sync, skip conflicts and just log them
+      if (options.isBackground) {
+        new Notice(
+          `Background sync: Skipping ${conflicts.length} conflicts. Use manual Smart Sync to resolve.`,
+        );
+        // Remove conflicts from sync operations
+        conflicts.forEach((conflict) => {
+          const uploadIndex = filesToUpload.findIndex(
+            (f) => f.path === conflict.filePath,
+          );
+          const downloadIndex = filesToDownload.findIndex(
+            (path) => path === conflict.filePath,
+          );
+          if (uploadIndex >= 0) filesToUpload.splice(uploadIndex, 1);
+          if (downloadIndex >= 0) filesToDownload.splice(downloadIndex, 1);
+        });
+      } else {
+        // For manual sync, show conflict resolution dialog
+        console.log("Showing conflict resolution dialog...");
 
-      // Show conflict resolution modal
-      const modal = new ConflictResolutionModal(
-        this.app,
-        this,
-        conflicts,
-        async (resolutions: ConflictResolution[]) => {
-          // Process conflict resolutions
-          for (const resolution of resolutions) {
-            if (resolution.choice === "local") {
-              // User chose to keep local version - upload it
-              const localFile = localFiles.find(
-                (f) => f.path === resolution.filePath,
-              );
-              if (localFile) {
-                filesToUpload.push(localFile);
-                console.log(
-                  `🔄 CONFLICT RESOLVED: Will upload ${resolution.filePath} (keep local)`,
-                );
-              }
-            } else {
-              // User chose to use cloud version - download it
-              filesToDownload.push(resolution.filePath);
-              console.log(
-                `🔄 CONFLICT RESOLVED: Will download ${resolution.filePath} (use cloud)`,
+        // Load content for text file conflicts to show preview
+        for (const conflict of conflicts) {
+          const localFile = localFiles.find(
+            (f) => f.path === conflict.filePath,
+          );
+          if (localFile && this.getFileType(localFile) === "text") {
+            try {
+              conflict.localContent = await this.app.vault.read(localFile);
+              // Get cloud content - we'll need to fetch it
+              // For now, we'll resolve conflicts without content preview
+              // This could be enhanced later by fetching cloud content
+            } catch (error) {
+              console.error(
+                `Failed to read local file ${conflict.filePath}:`,
+                error,
               );
             }
           }
+        }
 
-          // Continue with normal sync after resolving conflicts
-          await this.executeSyncOperations(filesToUpload, filesToDownload);
-        },
-      );
+        // Show conflict resolution modal
+        const modal = new ConflictResolutionModal(
+          this.app,
+          this,
+          conflicts,
+          async (resolutions: ConflictResolution[]) => {
+            // Process conflict resolutions
+            for (const resolution of resolutions) {
+              if (resolution.choice === "local") {
+                // User chose to keep local version - upload it
+                const localFile = localFiles.find(
+                  (f) => f.path === resolution.filePath,
+                );
+                if (localFile) {
+                  filesToUpload.push(localFile);
+                  console.log(
+                    `🔄 CONFLICT RESOLVED: Will upload ${resolution.filePath} (keep local)`,
+                  );
+                }
+              } else {
+                // User chose to use cloud version - download it
+                filesToDownload.push(resolution.filePath);
+                console.log(
+                  `🔄 CONFLICT RESOLVED: Will download ${resolution.filePath} (use cloud)`,
+                );
+              }
+            }
 
-      modal.open();
-      return; // Exit early, modal callback will continue the sync
+            // Continue with normal sync after resolving conflicts
+            await this.executeSyncOperations(
+              filesToUpload,
+              filesToDownload,
+              options,
+            );
+          },
+        );
+
+        modal.open();
+        return; // Exit early, modal callback will continue the sync
+      }
     }
 
     // No conflicts, proceed with normal sync
-    await this.executeSyncOperations(filesToUpload, filesToDownload);
+    await this.executeSyncOperations(filesToUpload, filesToDownload, options);
   }
 
   private async executeSyncOperations(
     filesToUpload: TFile[],
     filesToDownload: string[],
+    options: {
+      isBackground?: boolean;
+      maxFiles?: number;
+      showConflicts?: boolean;
+      rateLimitMs?: number;
+    } = {},
   ) {
-    const totalOperations = filesToUpload.length + filesToDownload.length;
+    // Apply limits for background sync
+    const maxFiles = options.maxFiles || Number.MAX_SAFE_INTEGER;
+    const rateLimitMs = options.rateLimitMs || 500;
+    const isBackground = options.isBackground || false;
+
+    // Limit files for background sync
+    const limitedFilesToUpload = isBackground
+      ? filesToUpload.slice(0, maxFiles)
+      : filesToUpload;
+    const limitedFilesToDownload = isBackground
+      ? filesToDownload.slice(0, maxFiles)
+      : filesToDownload;
+
+    const totalOperations =
+      limitedFilesToUpload.length + limitedFilesToDownload.length;
     if (totalOperations === 0) {
-      new Notice("✅ All files are already in sync");
+      if (!isBackground) {
+        new Notice("✅ All files are already in sync");
+      }
       this.isBulkSyncing = false;
       this.updateStatusBar("Connected", "connected");
       return;
     }
 
     this.syncProgress = { current: 0, total: totalOperations };
+    const syncType = isBackground ? "Background sync" : "Smart sync";
     console.log(
-      `Smart sync: ${filesToUpload.length} uploads, ${filesToDownload.length} downloads`,
+      `${syncType}: ${limitedFilesToUpload.length} uploads, ${limitedFilesToDownload.length} downloads`,
     );
 
-    // Process uploads first (in batches)
-    const batchSize = this.settings.batchSize;
-    for (let i = 0; i < filesToUpload.length; i += batchSize) {
-      const batch = filesToUpload.slice(i, i + batchSize);
+    // Process uploads first (in batches or individually for background)
+    const batchSize = isBackground ? 1 : this.settings.batchSize;
+    for (let i = 0; i < limitedFilesToUpload.length; i += batchSize) {
+      const batch = limitedFilesToUpload.slice(i, i + batchSize);
 
-      await Promise.all(
-        batch.map(async (file) => {
+      if (isBackground) {
+        // Sequential processing for background sync
+        for (const file of batch) {
           try {
             await this.uploadFile(file.path);
             this.syncProgress.current++;
-            this.updateStatusBar("Smart syncing", "syncing");
+            await new Promise((resolve) => setTimeout(resolve, rateLimitMs));
           } catch (error) {
-            console.error(`Failed to upload file ${file.path}:`, error);
+            console.error(
+              `Background sync upload failed for ${file.path}:`,
+              error,
+            );
           }
-        }),
+        }
+      } else {
+        // Parallel processing for manual sync
+        await Promise.all(
+          batch.map(async (file) => {
+            try {
+              await this.uploadFile(file.path);
+              this.syncProgress.current++;
+              this.updateStatusBar("Smart syncing", "syncing");
+            } catch (error) {
+              console.error(`Failed to upload file ${file.path}:`, error);
+            }
+          }),
+        );
+
+        if (i + batchSize < limitedFilesToUpload.length) {
+          await new Promise((resolve) => setTimeout(resolve, rateLimitMs));
+        }
+      }
+    }
+
+    // Process downloads
+    if (isBackground) {
+      // Sequential processing for background sync
+      for (const filePath of limitedFilesToDownload) {
+        try {
+          await this.downloadFile(filePath);
+          await new Promise((resolve) => setTimeout(resolve, rateLimitMs));
+        } catch (error) {
+          console.error(
+            `Background sync download failed for ${filePath}:`,
+            error,
+          );
+        }
+      }
+    } else {
+      // Batch processing for manual sync
+      for (let i = 0; i < limitedFilesToDownload.length; i += batchSize) {
+        const batch = limitedFilesToDownload.slice(i, i + batchSize);
+
+        await Promise.all(
+          batch.map(async (filePath) => {
+            try {
+              await this.downloadFile(filePath);
+              this.syncProgress.current++;
+              this.updateStatusBar("Smart syncing", "syncing");
+            } catch (error) {
+              console.error(`Failed to download file ${filePath}:`, error);
+            }
+          }),
+        );
+
+        if (i + batchSize < limitedFilesToDownload.length) {
+          await new Promise((resolve) => setTimeout(resolve, rateLimitMs));
+        }
+      }
+    }
+
+    // Show completion notice
+    if (isBackground) {
+      if (
+        limitedFilesToUpload.length > 0 ||
+        limitedFilesToDownload.length > 0
+      ) {
+        console.log(
+          `Background sync completed: ${limitedFilesToUpload.length} uploaded, ${limitedFilesToDownload.length} downloaded`,
+        );
+      }
+    } else {
+      new Notice(
+        `Smart sync completed: ${limitedFilesToUpload.length} uploaded, ${limitedFilesToDownload.length} downloaded`,
       );
-
-      if (i + batchSize < filesToUpload.length) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
     }
 
-    // Process downloads (in batches)
-    for (let i = 0; i < filesToDownload.length; i += batchSize) {
-      const batch = filesToDownload.slice(i, i + batchSize);
-
-      batch.forEach((filePath) => {
-        this.downloadFile(filePath);
-      });
-
-      if (i + batchSize < filesToDownload.length) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    }
-
-    new Notice(
-      `Smart sync completed: ${filesToUpload.length} uploaded, ${filesToDownload.length} downloaded`,
-    );
     this.isBulkSyncing = false;
     this.syncProgress = { current: 0, total: 0 };
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -1809,101 +2104,80 @@ export default class ObsidianSyncPlugin extends Plugin {
       return;
     }
 
-    console.log("Performing smart auto-sync...");
+    console.log("Performing background smart sync...");
 
-    const localFiles = this.getAllLocalFiles();
-    const filesToUpload: TFile[] = [];
-    const filesToDownload: string[] = [];
-
-    // Check files that exist locally
-    localFiles.forEach((file) => {
-      if (!this.shouldSyncFile(file)) {
-        return;
-      }
-
-      const cloudFileInfo = cloudFiles[file.path];
-      if (!cloudFileInfo) {
-        // File doesn't exist in cloud, upload it
-        filesToUpload.push(file);
-        console.log(`Auto-sync: Will upload ${file.path} (not in cloud)`);
-      } else {
-        // Extract cloud timestamp info
-        const cloudLastModified =
-          typeof cloudFileInfo === "string"
-            ? 0
-            : cloudFileInfo.clientLastModified ||
-              cloudFileInfo.lastModified ||
-              0;
-
-        // Check if file has been modified since last sync or is newer than cloud version
-        const lastKnownTime = this.lastModifiedTimes.get(file.path);
-        const fileNeedsSync = !lastKnownTime || file.stat.mtime > lastKnownTime;
-        const localIsNewer = file.stat.mtime > cloudLastModified;
-
-        if (fileNeedsSync || localIsNewer) {
-          // File was modified locally or is newer than cloud, upload it
-          filesToUpload.push(file);
-          console.log(
-            `Auto-sync: Will upload ${file.path} (local: ${new Date(file.stat.mtime)}, cloud: ${new Date(cloudLastModified)})`,
-          );
-        }
-      }
+    // Use the same smart sync logic but with background-specific options
+    await this.processSmartSync(cloudFiles, {
+      isBackground: true,
+      maxFiles: 5,
+      showConflicts: false,
+      rateLimitMs: 1000,
     });
 
-    // Check files that exist only in cloud - download them
-    Object.keys(cloudFiles).forEach((cloudPath) => {
-      const localFile = localFiles.find((f) => f.path === cloudPath);
-      if (!localFile) {
-        filesToDownload.push(cloudPath);
-        console.log(`Auto-sync: Will download ${cloudPath} (not local)`);
-      }
-    });
-
-    // Perform uploads (limited batch size for auto-sync)
-    const maxAutoSyncFiles = 5;
-    for (let i = 0; i < Math.min(filesToUpload.length, maxAutoSyncFiles); i++) {
-      const file = filesToUpload[i];
-      try {
-        await this.uploadFile(file.path);
-        await new Promise((resolve) => setTimeout(resolve, 1000)); // Rate limiting
-      } catch (error) {
-        console.error(`Auto-sync upload failed for ${file.path}:`, error);
-      }
-    }
-
-    // Perform downloads (limited batch size for auto-sync)
-    for (
-      let i = 0;
-      i < Math.min(filesToDownload.length, maxAutoSyncFiles);
-      i++
-    ) {
-      const filePath = filesToDownload[i];
-      try {
-        this.downloadFile(filePath);
-        await new Promise((resolve) => setTimeout(resolve, 1000)); // Rate limiting
-      } catch (error) {
-        console.error(`Auto-sync download failed for ${filePath}:`, error);
-      }
-    }
-
-    if (
-      filesToUpload.length > maxAutoSyncFiles ||
-      filesToDownload.length > maxAutoSyncFiles
-    ) {
-      new Notice(
-        `Auto-sync: Processed ${maxAutoSyncFiles} files. Use Smart Sync command for full sync.`,
-      );
-    } else if (filesToUpload.length > 0 || filesToDownload.length > 0) {
-      new Notice(
-        `Auto-sync: ${filesToUpload.length} uploaded, ${filesToDownload.length} downloaded`,
-      );
-    }
+    this.isAutoSyncing = false;
   }
 
   private getAllLocalFiles(): TFile[] {
     return this.app.vault
       .getFiles()
       .filter((file) => file instanceof TFile) as TFile[];
+  }
+
+  async viewDeletedFiles() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      new Notice("Not connected to real-time sync");
+      return;
+    }
+
+    try {
+      // Request deleted files list from server
+      this.sendWebSocketMessage({
+        action: "list_deleted",
+      });
+
+      new Notice("Fetching deleted files...");
+    } catch (error) {
+      console.error("Error requesting deleted files:", error);
+      new Notice("Failed to fetch deleted files");
+    }
+  }
+
+  async restoreFile(filePath: string) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      new Notice("Not connected to real-time sync");
+      return;
+    }
+
+    try {
+      this.sendWebSocketMessage({
+        action: "restore",
+        filePath: filePath,
+      });
+
+      new Notice(`Restoring file: ${filePath}`);
+    } catch (error) {
+      console.error("Error restoring file:", error);
+      new Notice("Failed to restore file");
+    }
+  }
+
+  async requestDeletedFilesForSettings(
+    callback: (files: Record<string, any>) => void,
+  ) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Not connected to real-time sync");
+    }
+
+    this.pendingSettingsDeletedFilesCallback = callback;
+
+    try {
+      this.sendWebSocketMessage({
+        action: "list_deleted",
+      });
+    } catch (error) {
+      this.pendingSettingsDeletedFilesCallback = null;
+      throw error;
+    }
   }
 }
 
@@ -1919,6 +2193,16 @@ class SyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
 
     containerEl.empty();
+
+    // Connection Settings Section
+    containerEl.createEl("h2", { text: "🔗 Connection Settings" });
+
+    const connectionDesc = containerEl.createEl("p", {
+      text: "Configure your sync server connection. Get these values from your SST deployment output.",
+    });
+    connectionDesc.style.color = "var(--text-muted)";
+    connectionDesc.style.fontSize = "0.9em";
+    connectionDesc.style.marginBottom = "20px";
 
     new Setting(containerEl)
       .setName("WebSocket URL")
@@ -1947,45 +2231,32 @@ class SyncSettingTab extends PluginSettingTab {
         text.inputEl.type = "password";
       });
 
-    new Setting(containerEl)
-      .setName("Username")
-      .setDesc("Your username for sync (currently for future use)")
-      .addText((text) =>
-        text
-          .setPlaceholder("Enter your username")
-          .setValue(this.plugin.settings.username)
-          .onChange(async (value) => {
-            this.plugin.settings.username = value;
-            await this.plugin.saveSettings();
-          }),
-      );
+    // Sync Behavior Section
+    containerEl.createEl("h2", { text: "⚡ Sync Behavior" });
 
-    new Setting(containerEl)
-      .setName("Password")
-      .setDesc("Your password for sync (currently for future use)")
-      .addText((text) => {
-        text
-          .setPlaceholder("Enter your password")
-          .setValue(this.plugin.settings.password)
-          .onChange(async (value) => {
-            this.plugin.settings.password = value;
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.type = "password";
-      });
+    const syncOverview = containerEl.createEl("div");
+    syncOverview.innerHTML = `
+      <p style="color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px;">
+        ObSync has two sync modes that work together:
+      </p>
+      <ul style="color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px; padding-left: 20px;">
+        <li><strong>Live Sync:</strong> Files sync instantly as you type (always active when connected)</li>
+        <li><strong>Smart Sync:</strong> Bidirectional sync with conflict resolution (manual via commands, or automatic in background)</li>
+      </ul>
+    `;
 
-    containerEl.createEl("h3", { text: "Real-time Sync (File Watching)" });
+    containerEl.createEl("h3", { text: "📝 Live Sync (File Watching)" });
 
-    const realtimeDesc = containerEl.createEl("p", {
-      text: "Files are automatically synced when you edit them (always enabled when connected)",
+    const liveDesc = containerEl.createEl("p", {
+      text: "Automatically syncs files as you edit them. This is the primary sync method and is always active when connected.",
     });
-    realtimeDesc.style.color = "var(--text-muted)";
-    realtimeDesc.style.fontSize = "0.9em";
-    realtimeDesc.style.marginBottom = "20px";
+    liveDesc.style.color = "var(--text-muted)";
+    liveDesc.style.fontSize = "0.9em";
+    liveDesc.style.marginBottom = "20px";
 
     new Setting(containerEl)
-      .setName("Instant Sync Mode")
-      .setDesc("Sync files immediately when changed (no delay)")
+      .setName("Immediate Upload")
+      .setDesc("Upload files instantly when changed (no typing delay)")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.instantSyncMode)
@@ -1996,9 +2267,9 @@ class SyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Debounce Delay (ms)")
+      .setName("Typing Delay (ms)")
       .setDesc(
-        "Delay before syncing after you stop typing (ignored in instant mode)",
+        "Wait time after you stop typing before uploading (ignored if Immediate Upload is enabled)",
       )
       .addText((text) =>
         text
@@ -2013,19 +2284,19 @@ class SyncSettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "Background Auto-Sync" });
+    containerEl.createEl("h3", { text: "🔄 Background Smart Sync" });
 
-    const autoSyncDesc = containerEl.createEl("p", {
-      text: "Periodic background sync checks (separate from real-time file watching above)",
+    const backgroundDesc = containerEl.createEl("p", {
+      text: "Periodically runs Smart Sync in the background to catch files that may have been missed by live sync or changed on other devices. Uses the same logic as manual Smart Sync but with conservative limits.",
     });
-    autoSyncDesc.style.color = "var(--text-muted)";
-    autoSyncDesc.style.fontSize = "0.9em";
-    autoSyncDesc.style.marginBottom = "20px";
+    backgroundDesc.style.color = "var(--text-muted)";
+    backgroundDesc.style.fontSize = "0.9em";
+    backgroundDesc.style.marginBottom = "20px";
 
     new Setting(containerEl)
-      .setName("Enable Background Auto-Sync")
+      .setName("Enable Background Smart Sync")
       .setDesc(
-        "Automatically run sync checks in the background at regular intervals",
+        "Automatically run Smart Sync at regular intervals (max 5 files per run, skips conflicts)",
       )
       .addToggle((toggle) =>
         toggle
@@ -2048,8 +2319,8 @@ class SyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Auto-Sync Interval (seconds)")
-      .setDesc("How often to run background sync checks")
+      .setName("Check Interval (seconds)")
+      .setDesc("How often to check for missed changes")
       .addText((text) =>
         text
           .setPlaceholder("30")
@@ -2073,7 +2344,14 @@ class SyncSettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "File Filtering" });
+    containerEl.createEl("h2", { text: "📁 File Filtering" });
+
+    const filteringDesc = containerEl.createEl("p", {
+      text: "Control which files and folders are included in sync operations.",
+    });
+    filteringDesc.style.color = "var(--text-muted)";
+    filteringDesc.style.fontSize = "0.9em";
+    filteringDesc.style.marginBottom = "20px";
 
     new Setting(containerEl)
       .setName("Sync All File Types")
@@ -2148,7 +2426,7 @@ class SyncSettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "Performance & Limits" });
+    containerEl.createEl("h2", { text: "⚙️ Performance & Limits" });
 
     new Setting(containerEl)
       .setName("Chunk Size (KB)")
@@ -2248,7 +2526,7 @@ class SyncSettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "Debug & Development" });
+    containerEl.createEl("h2", { text: "🔧 Debug & Development" });
 
     new Setting(containerEl)
       .setName("Enable Debug Logging")
@@ -2274,39 +2552,78 @@ class SyncSettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "Instructions" });
+    // Deleted Files Section
+    containerEl.createEl("h2", { text: "🗑️ Deleted Files" });
+
+    const deletedDesc = containerEl.createEl("p", {
+      text: "View and restore files that have been deleted. Files are kept for 30 days before permanent deletion.",
+    });
+    deletedDesc.style.color = "var(--text-muted)";
+    deletedDesc.style.fontSize = "0.9em";
+    deletedDesc.style.marginBottom = "20px";
+
+    // Container for deleted files list
+    const deletedFilesContainer = containerEl.createEl("div");
+    deletedFilesContainer.id = "deleted-files-container";
+    deletedFilesContainer.style.border =
+      "1px solid var(--background-modifier-border)";
+    deletedFilesContainer.style.borderRadius = "8px";
+    deletedFilesContainer.style.padding = "15px";
+    deletedFilesContainer.style.marginBottom = "20px";
+    deletedFilesContainer.style.backgroundColor = "var(--background-secondary)";
+
+    // Initial loading state
+    deletedFilesContainer.createEl("p", {
+      text: "Click 'Refresh Deleted Files' to load deleted files list",
+      cls: "deleted-files-placeholder",
+    });
+
+    new Setting(containerEl)
+      .setName("Refresh Deleted Files")
+      .setDesc("Load the current list of deleted files from the server")
+      .addButton((button) =>
+        button
+          .setButtonText("Refresh")
+          .setCta()
+          .onClick(async () => {
+            await this.refreshDeletedFiles(deletedFilesContainer);
+          }),
+      );
+
+    containerEl.createEl("h2", { text: "📖 Quick Start Guide" });
 
     const instructions = containerEl.createEl("div");
     instructions.innerHTML = `
-			<p><strong>Quick Start:</strong></p>
-			<ol>
-				<li>Enter your WebSocket URL above (get this from your SST deployment output)</li>
-				<li><strong>Click the sync status indicator</strong> in the status bar to toggle sync on/off</li>
-			</ol>
+			<div style="background: var(--background-secondary); padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+				<p><strong>🚀 Getting Started:</strong></p>
+				<ol style="margin: 10px 0; padding-left: 20px;">
+					<li>Enter your WebSocket URL and API Key above</li>
+					<li>Click the sync status indicator in the status bar to connect</li>
+					<li>Files will sync automatically as you edit them!</li>
+				</ol>
+			</div>
 			
-			<p><strong>Status Indicators:</strong></p>
-			<ul>
-				<li>🟢 <strong>Connected</strong> - Real-time sync active, files sync automatically</li>
-				<li>🔴 <strong>Disconnected</strong> - Sync off, click to connect</li>
-				<li>🔵 <strong>Syncing</strong> - Processing file operations</li>
-				<li>🟡 <strong>Error</strong> - Connection issues, click to retry</li>
+			<p><strong>Status Bar Indicators:</strong></p>
+			<ul style="margin: 10px 0; padding-left: 20px;">
+				<li>🟢 <strong>Connected</strong> - Live sync active</li>
+				<li>🔴 <strong>Disconnected</strong> - Click to connect</li>
+				<li>🔵 <strong>Syncing</strong> - Processing files</li>
+				<li>🟡 <strong>Error</strong> - Connection issues</li>
 			</ul>
 
-			<p><strong>Three Types of Sync:</strong></p>
-			<ol>
-				<li><strong>🎯 Real-time Sync</strong> - Files sync automatically when you edit them (always on when connected)</li>
-				<li><strong>🔄 Background Auto-Sync</strong> - Periodic checks for missing/changed files (optional, configurable interval)</li>
-				<li><strong>⚡ Manual Smart Sync</strong> - Full bidirectional sync with conflict resolution (triggered via commands)</li>
-			</ol>
-
-			<p><strong>Commands (Ctrl/Cmd+P):</strong></p>
-			<ul>
-				<li><strong>Sync: Smart sync</strong> - ⭐ Full bidirectional sync with conflict resolution</li>
-				<li><strong>Sync: Toggle auto-sync</strong> - Enable/disable background auto-sync</li>
+			<p><strong>Available Commands (Ctrl/Cmd+P):</strong></p>
+			<ul style="margin: 10px 0; padding-left: 20px;">
+				<li><strong>Sync: Smart sync</strong> - Full bidirectional sync with conflict resolution</li>
 				<li><strong>Sync: Check sync status</strong> - Compare local vs cloud files</li>
-				<li><strong>Sync: Upload active file</strong> - Manual upload of current file</li>
-				<li><strong>Sync: Download active file</strong> - Manual download of current file</li>
+				<li><strong>Sync: Upload/Download active file</strong> - Manual file operations</li>
+				<li><strong>Sync: Toggle background sync</strong> - Enable/disable periodic checks</li>
 			</ul>
+			
+			<div style="background: var(--background-modifier-border); padding: 10px; border-radius: 6px; margin-top: 15px;">
+				<p style="margin: 0; font-size: 0.9em; color: var(--text-muted);">
+					<strong>💡 Tip:</strong> Live sync handles most scenarios automatically. Use Smart Sync when you need to resolve conflicts or sync after being offline.
+				</p>
+			</div>
 
 			<p><strong>💡 Pro Tips:</strong></p>
 			<ul>
@@ -2316,6 +2633,131 @@ class SyncSettingTab extends PluginSettingTab {
 				<li>Adjust debounce delay if you want faster/slower real-time sync</li>
 			</ul>
 		`;
+  }
+
+  private async refreshDeletedFiles(container: HTMLElement) {
+    if (!this.plugin.ws || this.plugin.ws.readyState !== WebSocket.OPEN) {
+      container.empty();
+      container.createEl("p", {
+        text: "❌ Not connected to sync server. Please connect first.",
+        cls: "deleted-files-error",
+      });
+      return;
+    }
+
+    // Show loading state
+    container.empty();
+    container.createEl("p", {
+      text: "🔄 Loading deleted files...",
+      cls: "deleted-files-loading",
+    });
+
+    try {
+      await this.plugin.requestDeletedFilesForSettings((deletedFiles) => {
+        this.displayDeletedFiles(container, deletedFiles);
+      });
+    } catch (error) {
+      console.error("Error fetching deleted files:", error);
+      container.empty();
+      container.createEl("p", {
+        text: "❌ Failed to load deleted files. Please try again.",
+        cls: "deleted-files-error",
+      });
+    }
+  }
+
+  private displayDeletedFiles(
+    container: HTMLElement,
+    deletedFiles: Record<string, any>,
+  ) {
+    container.empty();
+
+    const filesList = Object.keys(deletedFiles);
+
+    if (filesList.length === 0) {
+      container.createEl("p", {
+        text: "✅ No deleted files found.",
+        cls: "deleted-files-empty",
+      });
+      return;
+    }
+
+    // Header with count
+    const headerEl = container.createEl("div");
+    headerEl.style.marginBottom = "15px";
+    headerEl.createEl("strong", {
+      text: `Found ${filesList.length} deleted file(s)`,
+    });
+    headerEl.createEl("p", {
+      text: "Files will be permanently deleted after 30 days.",
+      cls: "deleted-files-note",
+    });
+
+    // Files list
+    const listEl = container.createEl("div");
+    listEl.style.maxHeight = "300px";
+    listEl.style.overflowY = "auto";
+    listEl.style.border = "1px solid var(--background-modifier-border-hover)";
+    listEl.style.borderRadius = "4px";
+
+    filesList.forEach((filePath, index) => {
+      const fileInfo = deletedFiles[filePath];
+      const fileEl = listEl.createEl("div");
+      fileEl.style.display = "flex";
+      fileEl.style.justifyContent = "space-between";
+      fileEl.style.alignItems = "center";
+      fileEl.style.padding = "12px";
+      if (index < filesList.length - 1) {
+        fileEl.style.borderBottom =
+          "1px solid var(--background-modifier-border-hover)";
+      }
+
+      const infoEl = fileEl.createEl("div");
+      infoEl.style.flex = "1";
+      infoEl.style.minWidth = "0";
+
+      const pathEl = infoEl.createEl("div", {
+        text: filePath,
+        cls: "deleted-file-path",
+      });
+      pathEl.style.fontWeight = "500";
+      pathEl.style.marginBottom = "4px";
+      pathEl.style.wordBreak = "break-all";
+
+      const deletedDate = new Date(fileInfo.deletedAt).toLocaleString();
+      const expiresDate = new Date(fileInfo.expireAt * 1000).toLocaleString();
+
+      const metaEl = infoEl.createEl("small", {
+        text: `Deleted: ${deletedDate} | Expires: ${expiresDate}`,
+        cls: "deleted-file-meta",
+      });
+      metaEl.style.color = "var(--text-muted)";
+      metaEl.style.fontSize = "0.8em";
+
+      const restoreBtn = fileEl.createEl("button", {
+        text: "Restore",
+        cls: "mod-cta",
+      });
+      restoreBtn.style.marginLeft = "10px";
+      restoreBtn.style.flexShrink = "0";
+
+      restoreBtn.onclick = async () => {
+        restoreBtn.disabled = true;
+        restoreBtn.textContent = "Restoring...";
+
+        try {
+          await this.plugin.restoreFile(filePath);
+          // Refresh the list after restore
+          setTimeout(() => {
+            this.refreshDeletedFiles(container);
+          }, 1000);
+        } catch (error) {
+          restoreBtn.disabled = false;
+          restoreBtn.textContent = "Restore";
+          console.error("Error restoring file:", error);
+        }
+      };
+    });
   }
 }
 
@@ -2453,5 +2895,94 @@ class ConflictResolutionModal extends Modal {
 
     this.currentIndex++;
     this.displayConflict();
+  }
+}
+
+class DeletedFilesModal extends Modal {
+  private deletedFiles: Record<string, any>;
+  private onRestore: (filePath: string) => void;
+
+  constructor(
+    app: App,
+    deletedFiles: Record<string, any>,
+    onRestore: (filePath: string) => void,
+  ) {
+    super(app);
+    this.deletedFiles = deletedFiles;
+    this.onRestore = onRestore;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Deleted Files" });
+
+    const filesList = Object.keys(this.deletedFiles);
+
+    if (filesList.length === 0) {
+      contentEl.createEl("p", { text: "No deleted files found." });
+      return;
+    }
+
+    contentEl.createEl("p", {
+      text: `Found ${filesList.length} deleted file(s). Files will be permanently deleted after 30 days.`,
+    });
+
+    const listEl = contentEl.createEl("div");
+    listEl.style.maxHeight = "400px";
+    listEl.style.overflowY = "auto";
+    listEl.style.border = "1px solid var(--background-modifier-border)";
+    listEl.style.borderRadius = "4px";
+    listEl.style.padding = "10px";
+    listEl.style.marginTop = "10px";
+
+    filesList.forEach((filePath) => {
+      const fileInfo = this.deletedFiles[filePath];
+      const fileEl = listEl.createEl("div");
+      fileEl.style.display = "flex";
+      fileEl.style.justifyContent = "space-between";
+      fileEl.style.alignItems = "center";
+      fileEl.style.padding = "8px";
+      fileEl.style.borderBottom =
+        "1px solid var(--background-modifier-border-hover)";
+
+      const infoEl = fileEl.createEl("div");
+      infoEl.createEl("div", {
+        text: filePath,
+        cls: "deleted-file-path",
+      });
+
+      const deletedDate = new Date(fileInfo.deletedAt).toLocaleString();
+      const expiresDate = new Date(fileInfo.expireAt * 1000).toLocaleString();
+
+      infoEl.createEl("small", {
+        text: `Deleted: ${deletedDate} | Expires: ${expiresDate}`,
+        cls: "deleted-file-meta",
+      });
+
+      const restoreBtn = fileEl.createEl("button", {
+        text: "Restore",
+        cls: "mod-cta",
+      });
+
+      restoreBtn.onclick = () => {
+        this.onRestore(filePath);
+        this.close();
+      };
+    });
+
+    // Close button
+    const closeBtn = contentEl.createEl("button", {
+      text: "Close",
+      cls: "mod-cta",
+    });
+    closeBtn.style.marginTop = "20px";
+    closeBtn.onclick = () => this.close();
+  }
+
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
   }
 }

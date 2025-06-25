@@ -5,6 +5,10 @@
 
 declare module "sst" {
   export interface Resource {
+    "ApiKey": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
     "Storage": {
       "name": string
       "type": "sst.aws.Bucket"

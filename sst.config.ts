@@ -15,6 +15,9 @@ export default $config({
       args.architecture ??= "arm64";
     });
 
+    // API Key secret for authentication
+    const apiKeySecret = new sst.Secret("ApiKey");
+
     const bucket = new sst.aws.Bucket("Storage");
 
     const table = new sst.aws.Dynamo("Table", {
@@ -35,40 +38,43 @@ export default $config({
       ttl: "expireAt",
     });
 
-    // TODO:
-    table.subscribe("MySubscriber", "packages/backend/src/subscriber.handler", {
-      filters: [
-        {
-          dynamodb: {
-            Keys: {
-              CustomerName: {
-                S: ["AnyCompany Industries"]
-              }
-            }
-          }
-        }
-      ]
-    });
+    // DynamoDB Stream subscriber for handling TTL expiration
+    table.subscribe(
+      "TTLExpirationSubscriber",
+      {
+        handler: "packages/backend/src/websocket/connect.handler",
+        link: [table],
+      },
+      {
+        filters: [
+          {
+            dynamodb: {
+              eventName: ["REMOVE"],
+            },
+          },
+        ],
+      },
+    );
 
     // WebSocket API for real-time sync
     const websocketApi = new sst.aws.ApiGatewayWebSocket("WebSocketAPI", {
       accessLog: {
-        retention: "1 week"
-      }
+        retention: "1 week",
+      },
     });
 
     // Create routes to WebSocket API
     websocketApi.route("$connect", {
       handler: "packages/backend/src/websocket/connect.handler",
-      link: [table, websocketApi],
+      link: [table, websocketApi, apiKeySecret],
     });
     websocketApi.route("$disconnect", {
       handler: "packages/backend/src/websocket/disconnect.handler",
-      link: [table, websocketApi],
+      link: [table, websocketApi, apiKeySecret],
     });
     websocketApi.route("$default", {
       handler: "packages/backend/src/websocket/message.handler",
-      link: [table, bucket, websocketApi],
+      link: [table, bucket, websocketApi, apiKeySecret],
     });
   },
 });

@@ -4,7 +4,6 @@ import {
 } from "@aws-sdk/client-apigatewaymanagementapi";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
-  DeleteObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -12,9 +11,9 @@ import {
 import {
   DeleteCommand,
   DynamoDBDocumentClient,
-  GetCommand,
   PutCommand,
   ScanCommand,
+  UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import type { APIGatewayProxyHandler } from "aws-lambda";
 import { Resource } from "sst";
@@ -51,6 +50,25 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     const message = JSON.parse(event.body || "{}");
     console.log(`WebSocket message from ${connectionId}:`, message);
 
+    // Check API key authentication for all messages
+    if (!message.apiKey) {
+      console.error("No API key provided in message");
+      await sendToConnection(apiGatewayClient, connectionId, {
+        type: "error",
+        message: "API key required",
+      });
+      return { statusCode: 401, body: "API key required" };
+    }
+
+    if (message.apiKey !== Resource.ApiKey.value) {
+      console.error("Invalid API key provided in message");
+      await sendToConnection(apiGatewayClient, connectionId, {
+        type: "error",
+        message: "Invalid API key",
+      });
+      return { statusCode: 401, body: "Invalid API key" };
+    }
+
     // Handle chunked messages
     if (
       message.isChunked &&
@@ -78,6 +96,10 @@ export const handler: APIGatewayProxyHandler = async (event) => {
         return await handleFileDelete(message, connectionId, apiGatewayClient);
       case "list":
         return await handleFileList(connectionId, apiGatewayClient);
+      case "list_deleted":
+        return await handleDeletedFileList(connectionId, apiGatewayClient);
+      case "restore":
+        return await handleFileRestore(message, connectionId, apiGatewayClient);
       case "ping":
         await sendToConnection(apiGatewayClient, connectionId, {
           type: "pong",
@@ -392,67 +414,42 @@ async function handleFileDelete(
   }
 
   try {
-    const key = `files/${filePath}`;
-
-    // Soft delete: Mark as deleted in DynamoDB with TTL
+    // Soft delete: Add expireAt field to existing version records instead of hard deleting
     const expirationTime = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60; // 30 days
+    const deletedAt = Date.now();
 
-    await docClient.send(
-      new PutCommand({
+    // Find all version records for this file
+    const scanResponse = await docClient.send(
+      new ScanCommand({
         TableName: Resource.Table.name,
-        Item: {
-          pk: `FILE#${filePath}`,
-          sk: `DELETED#${Date.now()}`,
-          filePath,
-          deleted: true,
-          deletedAt: Date.now(),
-          deletedBy: connectionId,
-          expireAt: expirationTime, // DynamoDB TTL field - must be configured on table
+        FilterExpression: "pk = :pk AND begins_with(sk, :sk)",
+        ExpressionAttributeValues: {
+          ":pk": `FILE#${filePath}`,
+          ":sk": "VERSION#",
         },
       }),
     );
 
-    // Remove the active file record to keep list queries clean
-    // Note: In a production system, you might want to scan and delete all VERSION# records
-    // For now, we'll just delete the latest version record if it exists
-    try {
-      const scanResponse = await docClient.send(
-        new ScanCommand({
+    // Soft delete all version records by adding expireAt field
+    for (const item of scanResponse.Items || []) {
+      await docClient.send(
+        new UpdateCommand({
           TableName: Resource.Table.name,
-          FilterExpression: "pk = :pk AND begins_with(sk, :sk)",
+          Key: {
+            pk: item.pk,
+            sk: item.sk,
+          },
+          UpdateExpression:
+            "SET deleted = :deleted, deletedAt = :deletedAt, deletedBy = :deletedBy, expireAt = :expireAt",
           ExpressionAttributeValues: {
-            ":pk": `FILE#${filePath}`,
-            ":sk": "VERSION#",
+            ":deleted": true,
+            ":deletedAt": deletedAt,
+            ":deletedBy": connectionId,
+            ":expireAt": expirationTime,
           },
         }),
       );
-
-      // Delete all version records for this file
-      for (const item of scanResponse.Items || []) {
-        await docClient.send(
-          new DeleteCommand({
-            TableName: Resource.Table.name,
-            Key: {
-              pk: item.pk,
-              sk: item.sk,
-            },
-          }),
-        );
-      }
-    } catch (error) {
-      console.log(
-        "Note: Could not delete all version records, continuing...",
-        error,
-      );
     }
-
-    // Also delete from S3 to save storage costs
-    await s3Client.send(
-      new DeleteObjectCommand({
-        Bucket: Resource.Storage.name,
-        Key: key,
-      }),
-    );
 
     // Notify the deleter
     await sendToConnection(apiGatewayClient, connectionId, {
@@ -467,7 +464,7 @@ async function handleFileDelete(
       action: "delete",
     });
 
-    console.log(`File deleted: ${filePath}`);
+    console.log(`File soft deleted: ${filePath}`);
     return { statusCode: 200, body: "File deleted successfully" };
   } catch (error) {
     console.error("Delete error:", error);
@@ -526,6 +523,127 @@ async function handleFileList(
       message: "Failed to list files",
     });
     return { statusCode: 500, body: "Failed to list files" };
+  }
+}
+
+async function handleDeletedFileList(
+  connectionId: string,
+  apiGatewayClient: ApiGatewayManagementApiClient,
+) {
+  try {
+    // Get all deleted files from DynamoDB
+    const response = await docClient.send(
+      new ScanCommand({
+        TableName: Resource.Table.name,
+        FilterExpression:
+          "begins_with(pk, :filePrefix) AND begins_with(sk, :versionPrefix) AND deleted = :deleted",
+        ExpressionAttributeValues: {
+          ":filePrefix": "FILE#",
+          ":versionPrefix": "VERSION#",
+          ":deleted": true,
+        },
+      }),
+    );
+
+    const deletedFiles: Record<string, any> = {};
+    response.Items?.forEach((item) => {
+      if (item.filePath && item.deleted) {
+        deletedFiles[item.filePath] = {
+          version: item.version,
+          deletedAt: item.deletedAt,
+          deletedBy: item.deletedBy,
+          expireAt: item.expireAt,
+          lastModified: item.lastModified || 0,
+          fileType: item.fileType || "text",
+        };
+      }
+    });
+
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "deleted_files_list",
+      files: deletedFiles,
+    });
+
+    console.log(
+      `Deleted file list sent to ${connectionId}, found ${Object.keys(deletedFiles).length} deleted files`,
+    );
+    return { statusCode: 200, body: "Deleted file list sent successfully" };
+  } catch (error) {
+    console.error("Deleted list error:", error);
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "error",
+      message: "Failed to list deleted files",
+    });
+    return { statusCode: 500, body: "Failed to list deleted files" };
+  }
+}
+
+async function handleFileRestore(
+  message: any,
+  connectionId: string,
+  apiGatewayClient: ApiGatewayManagementApiClient,
+) {
+  const { filePath } = message;
+
+  if (!filePath) {
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "error",
+      message: "Missing filePath",
+    });
+    return { statusCode: 400, body: "Missing filePath" };
+  }
+
+  try {
+    // Find all deleted version records for this file
+    const scanResponse = await docClient.send(
+      new ScanCommand({
+        TableName: Resource.Table.name,
+        FilterExpression:
+          "pk = :pk AND begins_with(sk, :sk) AND deleted = :deleted",
+        ExpressionAttributeValues: {
+          ":pk": `FILE#${filePath}`,
+          ":sk": "VERSION#",
+          ":deleted": true,
+        },
+      }),
+    );
+
+    // Restore all version records by removing the deleted fields
+    for (const item of scanResponse.Items || []) {
+      await docClient.send(
+        new UpdateCommand({
+          TableName: Resource.Table.name,
+          Key: {
+            pk: item.pk,
+            sk: item.sk,
+          },
+          UpdateExpression: "REMOVE deleted, deletedAt, deletedBy, expireAt",
+        }),
+      );
+    }
+
+    // Notify the restorer
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "restore_success",
+      filePath,
+    });
+
+    // Broadcast file restoration to other connected clients
+    await broadcastFileChange(apiGatewayClient, connectionId, {
+      type: "file_changed",
+      filePath,
+      action: "restore",
+    });
+
+    console.log(`File restored: ${filePath}`);
+    return { statusCode: 200, body: "File restored successfully" };
+  } catch (error) {
+    console.error("Restore error:", error);
+    await sendToConnection(apiGatewayClient, connectionId, {
+      type: "error",
+      message: "Restore failed",
+    });
+    return { statusCode: 500, body: "Restore failed" };
   }
 }
 
