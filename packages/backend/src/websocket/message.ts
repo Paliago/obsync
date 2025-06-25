@@ -1,8 +1,22 @@
-import { APIGatewayProxyHandler } from "aws-lambda";
+import {
+  ApiGatewayManagementApiClient,
+  PostToConnectionCommand,
+} from "@aws-sdk/client-apigatewaymanagementapi";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, ScanCommand, PutCommand, GetCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { ApiGatewayManagementApiClient, PostToConnectionCommand } from "@aws-sdk/client-apigatewaymanagementapi";
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import {
+  DeleteCommand,
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  ScanCommand,
+} from "@aws-sdk/lib-dynamodb";
+import type { APIGatewayProxyHandler } from "aws-lambda";
 import { Resource } from "sst";
 
 const dynamoClient = new DynamoDBClient({});
@@ -11,15 +25,18 @@ const s3Client = new S3Client({});
 
 // In-memory chunk storage (for Lambda lifecycle)
 // In production, you might want to use DynamoDB for chunk storage
-const chunkBuffers = new Map<string, {
-  chunks: Map<number, string>;
-  totalChunks: number;
-  filePath: string;
-  fileType: string;
-  lastModified?: number;
-  connectionId: string;
-  action: string;
-}>();
+const chunkBuffers = new Map<
+  string,
+  {
+    chunks: Map<number, string>;
+    totalChunks: number;
+    filePath: string;
+    fileType: string;
+    lastModified?: number;
+    connectionId: string;
+    action: string;
+  }
+>();
 
 export const handler: APIGatewayProxyHandler = async (event) => {
   const connectionId = event.requestContext.connectionId!;
@@ -29,27 +46,42 @@ export const handler: APIGatewayProxyHandler = async (event) => {
   const apiGatewayClient = new ApiGatewayManagementApiClient({
     endpoint: `https://${domainName}/${stage}`,
   });
-  
+
   try {
     const message = JSON.parse(event.body || "{}");
     console.log(`WebSocket message from ${connectionId}:`, message);
 
     // Handle chunked messages
-    if (message.isChunked && message.chunkId && message.chunkIndex !== undefined && message.totalChunks) {
-      return await handleChunkedMessage(message, connectionId, apiGatewayClient);
+    if (
+      message.isChunked &&
+      message.chunkId &&
+      message.chunkIndex !== undefined &&
+      message.totalChunks
+    ) {
+      return await handleChunkedMessage(
+        message,
+        connectionId,
+        apiGatewayClient,
+      );
     }
 
     switch (message.action) {
       case "upload":
         return await handleFileUpload(message, connectionId, apiGatewayClient);
       case "download":
-        return await handleFileDownload(message, connectionId, apiGatewayClient);
+        return await handleFileDownload(
+          message,
+          connectionId,
+          apiGatewayClient,
+        );
       case "delete":
         return await handleFileDelete(message, connectionId, apiGatewayClient);
       case "list":
         return await handleFileList(connectionId, apiGatewayClient);
       case "ping":
-        await sendToConnection(apiGatewayClient, connectionId, { type: "pong" });
+        await sendToConnection(apiGatewayClient, connectionId, {
+          type: "pong",
+        });
         return { statusCode: 200, body: "pong" };
       default:
         console.log(`Unknown action: ${message.action}`);
@@ -72,11 +104,26 @@ export const handler: APIGatewayProxyHandler = async (event) => {
 async function handleChunkedMessage(
   message: any,
   connectionId: string,
-  apiGatewayClient: ApiGatewayManagementApiClient
+  apiGatewayClient: ApiGatewayManagementApiClient,
 ) {
-  const { chunkId, chunkIndex, totalChunks, filePath, content, action, fileType, lastModified } = message;
-  
-  if (!chunkId || chunkIndex === undefined || !totalChunks || !filePath || !action) {
+  const {
+    chunkId,
+    chunkIndex,
+    totalChunks,
+    filePath,
+    content,
+    action,
+    fileType,
+    lastModified,
+  } = message;
+
+  if (
+    !chunkId ||
+    chunkIndex === undefined ||
+    !totalChunks ||
+    !filePath ||
+    !action
+  ) {
     await sendToConnection(apiGatewayClient, connectionId, {
       type: "error",
       message: "Invalid chunked message",
@@ -90,24 +137,26 @@ async function handleChunkedMessage(
       chunks: new Map(),
       totalChunks,
       filePath,
-      fileType: fileType || 'text',
+      fileType: fileType || "text",
       lastModified,
       connectionId,
-      action
+      action,
     });
   }
 
   const buffer = chunkBuffers.get(chunkId)!;
-  
+
   // Store chunk
-  buffer.chunks.set(chunkIndex, content || '');
-  
-  console.log(`Received chunk ${chunkIndex + 1}/${totalChunks} for ${filePath} (${Math.round(new Blob([content || '']).size / 1024)}KB)`);
+  buffer.chunks.set(chunkIndex, content || "");
+
+  console.log(
+    `Received chunk ${chunkIndex + 1}/${totalChunks} for ${filePath} (${Math.round(new Blob([content || ""]).size / 1024)}KB)`,
+  );
 
   // Check if all chunks received
   if (buffer.chunks.size === buffer.totalChunks) {
     // Reassemble content
-    let fullContent = '';
+    let fullContent = "";
     for (let i = 0; i < buffer.totalChunks; i++) {
       const chunk = buffer.chunks.get(i);
       if (chunk === undefined) {
@@ -122,7 +171,9 @@ async function handleChunkedMessage(
       fullContent += chunk;
     }
 
-    console.log(`Successfully reassembled ${filePath} from ${buffer.totalChunks} chunks (${Math.round(new Blob([fullContent]).size / 1024)}KB)`);
+    console.log(
+      `Successfully reassembled ${filePath} from ${buffer.totalChunks} chunks (${Math.round(new Blob([fullContent]).size / 1024)}KB)`,
+    );
 
     // Clean up buffer
     chunkBuffers.delete(chunkId);
@@ -133,13 +184,18 @@ async function handleChunkedMessage(
       filePath: buffer.filePath,
       content: fullContent,
       fileType: buffer.fileType,
-      lastModified: buffer.lastModified
+      lastModified: buffer.lastModified,
     };
 
     // Process the complete message
     switch (buffer.action) {
       case "upload":
-        return await handleFileUpload(completeMessage, connectionId, apiGatewayClient, true);
+        return await handleFileUpload(
+          completeMessage,
+          connectionId,
+          apiGatewayClient,
+          true,
+        );
       default:
         console.log(`Unsupported chunked action: ${buffer.action}`);
         return { statusCode: 400, body: "Unsupported chunked action" };
@@ -151,13 +207,13 @@ async function handleChunkedMessage(
 }
 
 async function handleFileUpload(
-  message: any, 
-  connectionId: string, 
+  message: any,
+  connectionId: string,
   apiGatewayClient: ApiGatewayManagementApiClient,
-  isReassembledChunk: boolean = false
+  isReassembledChunk = false,
 ) {
   const { filePath, content, version, lastModified, fileType } = message;
-  
+
   if (!filePath || content === undefined) {
     await sendToConnection(apiGatewayClient, connectionId, {
       type: "error",
@@ -170,17 +226,17 @@ async function handleFileUpload(
   const newVersion = version || Date.now().toString();
   const uploadedAt = Date.now();
   const clientLastModified = lastModified || uploadedAt;
-  const detectedFileType = fileType || 'text';
+  const detectedFileType = fileType || "text";
 
   try {
     // For binary files, we need to handle the content differently
     let bodyContent: string | Buffer = content;
-    let contentType = 'text/plain';
+    let contentType = "text/plain";
 
-    if (detectedFileType === 'binary') {
+    if (detectedFileType === "binary") {
       // Content is base64 encoded, decode it for S3 storage
-      bodyContent = Buffer.from(content, 'base64');
-      contentType = 'application/octet-stream';
+      bodyContent = Buffer.from(content, "base64");
+      contentType = "application/octet-stream";
     }
 
     // Upload to S3
@@ -196,7 +252,7 @@ async function handleFileUpload(
           fileType: detectedFileType,
           clientLastModified: clientLastModified.toString(),
         },
-      })
+      }),
     );
 
     // Update DynamoDB with file metadata
@@ -213,7 +269,7 @@ async function handleFileUpload(
           uploadedBy: connectionId,
           fileType: detectedFileType,
         },
-      })
+      }),
     );
 
     // Notify the uploader - return the client's original lastModified time
@@ -234,7 +290,7 @@ async function handleFileUpload(
       fileType: detectedFileType,
     });
 
-    const logMessage = isReassembledChunk 
+    const logMessage = isReassembledChunk
       ? `Large file uploaded from chunks: ${filePath} version ${newVersion} (type: ${detectedFileType})`
       : `File uploaded: ${filePath} version ${newVersion} (type: ${detectedFileType})`;
     console.log(logMessage);
@@ -250,12 +306,12 @@ async function handleFileUpload(
 }
 
 async function handleFileDownload(
-  message: any, 
-  connectionId: string, 
-  apiGatewayClient: ApiGatewayManagementApiClient
+  message: any,
+  connectionId: string,
+  apiGatewayClient: ApiGatewayManagementApiClient,
 ) {
   const { filePath } = message;
-  
+
   if (!filePath) {
     await sendToConnection(apiGatewayClient, connectionId, {
       type: "error",
@@ -266,13 +322,13 @@ async function handleFileDownload(
 
   try {
     const key = `files/${filePath}`;
-    
+
     // Get file from S3
     const s3Response = await s3Client.send(
       new GetObjectCommand({
         Bucket: Resource.Storage.name,
         Key: key,
-      })
+      }),
     );
 
     const version = s3Response.Metadata?.version || "unknown";
@@ -280,18 +336,18 @@ async function handleFileDownload(
     const clientLastModified = s3Response.Metadata?.clientLastModified;
 
     let content: string;
-    
-    if (fileType === 'binary') {
+
+    if (fileType === "binary") {
       // For binary files, convert to base64
       const bodyBytes = await s3Response.Body?.transformToByteArray();
       if (bodyBytes) {
-        content = Buffer.from(bodyBytes).toString('base64');
+        content = Buffer.from(bodyBytes).toString("base64");
       } else {
-        throw new Error('Failed to read binary file content');
+        throw new Error("Failed to read binary file content");
       }
     } else {
       // For text files, get as string
-      content = await s3Response.Body?.transformToString() || '';
+      content = (await s3Response.Body?.transformToString()) || "";
     }
 
     // Send file content back through WebSocket
@@ -301,10 +357,14 @@ async function handleFileDownload(
       content,
       version,
       fileType,
-      lastModified: clientLastModified ? parseInt(clientLastModified) : undefined,
+      lastModified: clientLastModified
+        ? Number.parseInt(clientLastModified)
+        : undefined,
     });
 
-    console.log(`File downloaded: ${filePath} version ${version} (type: ${fileType})`);
+    console.log(
+      `File downloaded: ${filePath} version ${version} (type: ${fileType})`,
+    );
     return { statusCode: 200, body: "File downloaded successfully" };
   } catch (error) {
     console.error("Download error:", error);
@@ -317,12 +377,12 @@ async function handleFileDownload(
 }
 
 async function handleFileDelete(
-  message: any, 
-  connectionId: string, 
-  apiGatewayClient: ApiGatewayManagementApiClient
+  message: any,
+  connectionId: string,
+  apiGatewayClient: ApiGatewayManagementApiClient,
 ) {
   const { filePath } = message;
-  
+
   if (!filePath) {
     await sendToConnection(apiGatewayClient, connectionId, {
       type: "error",
@@ -333,10 +393,10 @@ async function handleFileDelete(
 
   try {
     const key = `files/${filePath}`;
-    
+
     // Soft delete: Mark as deleted in DynamoDB with TTL
-    const expirationTime = Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60); // 30 days
-    
+    const expirationTime = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60; // 30 days
+
     await docClient.send(
       new PutCommand({
         TableName: Resource.Table.name,
@@ -349,7 +409,7 @@ async function handleFileDelete(
           deletedBy: connectionId,
           expireAt: expirationTime, // DynamoDB TTL field - must be configured on table
         },
-      })
+      }),
     );
 
     // Remove the active file record to keep list queries clean
@@ -364,7 +424,7 @@ async function handleFileDelete(
             ":pk": `FILE#${filePath}`,
             ":sk": "VERSION#",
           },
-        })
+        }),
       );
 
       // Delete all version records for this file
@@ -376,11 +436,14 @@ async function handleFileDelete(
               pk: item.pk,
               sk: item.sk,
             },
-          })
+          }),
         );
       }
     } catch (error) {
-      console.log("Note: Could not delete all version records, continuing...", error);
+      console.log(
+        "Note: Could not delete all version records, continuing...",
+        error,
+      );
     }
 
     // Also delete from S3 to save storage costs
@@ -388,7 +451,7 @@ async function handleFileDelete(
       new DeleteObjectCommand({
         Bucket: Resource.Storage.name,
         Key: key,
-      })
+      }),
     );
 
     // Notify the deleter
@@ -417,20 +480,21 @@ async function handleFileDelete(
 }
 
 async function handleFileList(
-  connectionId: string, 
-  apiGatewayClient: ApiGatewayManagementApiClient
+  connectionId: string,
+  apiGatewayClient: ApiGatewayManagementApiClient,
 ) {
   try {
     // Get all files from DynamoDB (excluding deleted files)
     const response = await docClient.send(
       new ScanCommand({
         TableName: Resource.Table.name,
-        FilterExpression: "begins_with(pk, :filePrefix) AND begins_with(sk, :versionPrefix) AND attribute_not_exists(deleted)",
+        FilterExpression:
+          "begins_with(pk, :filePrefix) AND begins_with(sk, :versionPrefix) AND attribute_not_exists(deleted)",
         ExpressionAttributeValues: {
           ":filePrefix": "FILE#",
           ":versionPrefix": "VERSION#",
         },
-      })
+      }),
     );
 
     const files: Record<string, any> = {};
@@ -440,7 +504,7 @@ async function handleFileList(
           version: item.version,
           lastModified: item.lastModified || 0,
           clientLastModified: item.clientLastModified || item.lastModified || 0,
-          fileType: item.fileType || 'text',
+          fileType: item.fileType || "text",
         };
       }
     });
@@ -451,7 +515,9 @@ async function handleFileList(
       files,
     });
 
-    console.log(`File list sent to ${connectionId}, found ${Object.keys(files).length} files`);
+    console.log(
+      `File list sent to ${connectionId}, found ${Object.keys(files).length} files`,
+    );
     return { statusCode: 200, body: "File list sent successfully" };
   } catch (error) {
     console.error("List error:", error);
@@ -466,14 +532,14 @@ async function handleFileList(
 async function sendToConnection(
   apiGatewayClient: ApiGatewayManagementApiClient,
   connectionId: string,
-  data: any
+  data: any,
 ) {
   try {
     await apiGatewayClient.send(
       new PostToConnectionCommand({
         ConnectionId: connectionId,
         Data: JSON.stringify(data),
-      })
+      }),
     );
   } catch (error: any) {
     console.error(`Failed to send to connection ${connectionId}:`, error);
@@ -487,7 +553,7 @@ async function sendToConnection(
             pk: `CONNECTION#${connectionId}`,
             sk: `CONNECTION#${connectionId}`,
           },
-        })
+        }),
       );
     }
   }
@@ -496,7 +562,7 @@ async function sendToConnection(
 async function broadcastFileChange(
   apiGatewayClient: ApiGatewayManagementApiClient,
   excludeConnectionId: string,
-  data: any
+  data: any,
 ) {
   try {
     // Get all active connections
@@ -507,18 +573,25 @@ async function broadcastFileChange(
         ExpressionAttributeValues: {
           ":connPrefix": "CONNECTION#",
         },
-      })
+      }),
     );
 
-    const broadcastPromises = connections.Items?.map(async (connection) => {
-      if (connection.connectionId !== excludeConnectionId) {
-        await sendToConnection(apiGatewayClient, connection.connectionId, data);
-      }
-    }) || [];
+    const broadcastPromises =
+      connections.Items?.map(async (connection) => {
+        if (connection.connectionId !== excludeConnectionId) {
+          await sendToConnection(
+            apiGatewayClient,
+            connection.connectionId,
+            data,
+          );
+        }
+      }) || [];
 
     await Promise.all(broadcastPromises);
-    console.log(`Broadcasted file change to ${broadcastPromises.length} clients`);
+    console.log(
+      `Broadcasted file change to ${broadcastPromises.length} clients`,
+    );
   } catch (error) {
     console.error("Broadcast error:", error);
   }
-} 
+}

@@ -23,7 +23,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
           connectedAt: timestamp,
           expireAt: Math.floor(timestamp / 1000) + 86400, // 24 hours
         },
-      })
+      }),
     );
 
     return {
@@ -37,4 +37,4 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       body: "Failed to connect",
     };
   }
-}; 
+};

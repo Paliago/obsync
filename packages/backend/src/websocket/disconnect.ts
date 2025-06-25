@@ -1,6 +1,6 @@
-import { APIGatewayProxyHandler } from "aws-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, DeleteCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import type { APIGatewayProxyHandler } from "aws-lambda";
 import { Resource } from "sst";
 
 const dynamoClient = new DynamoDBClient({});
@@ -19,7 +19,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
           pk: `CONNECTION#${connectionId}`,
           sk: `CONNECTION#${connectionId}`,
         },
-      })
+      }),
     );
 
     return {
@@ -33,4 +33,4 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       body: "Failed to disconnect",
     };
   }
-}; 
+};
